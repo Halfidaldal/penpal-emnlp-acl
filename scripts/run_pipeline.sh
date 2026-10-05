@@ -46,6 +46,7 @@ if [[ $RENDER -eq 1 ]]; then
     analysis/comparison/novelty_comparison.Rmd \
     analysis/comparison/semantic_exploration_comparison.Rmd \
     analysis/comparison/transience_uptake_and_scorer_checks.Rmd \
+    analysis/comparison/robustness_checks.Rmd \
     analysis/human-ai/novelty.Rmd; do
     Rscript -e "rmarkdown::render('$notebook')"
   done

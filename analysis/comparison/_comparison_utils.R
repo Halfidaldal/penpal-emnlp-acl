@@ -359,6 +359,11 @@ load_novelty_data <- function(conditions = ALL_CONDITIONS) {
   load_conditions(conditions, "novelty_scores.csv", format = "csv", prepare = add_turn_index)
 }
 
+load_surface_metrics <- function(conditions = ALL_CONDITIONS) {
+  load_conditions(conditions, "interaction_level_surface_metrics.parquet",
+                  prepare = function(df) df %>% derive_condition_role() %>% add_turn_index())
+}
+
 load_exploration_data <- function(conditions = ALL_CONDITIONS) {
   load_conditions(conditions, "semantic_exploration_binned.parquet",
                   prepare = function(df) df %>% derive_condition_role() %>% add_turn_index() %>% drop_provider_error_stories())

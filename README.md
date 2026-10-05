@@ -34,6 +34,7 @@ Rscript -e 'rmarkdown::render("analysis/comparison/valence_alignment_comparison.
 Rscript -e 'rmarkdown::render("analysis/comparison/novelty_comparison.Rmd")'
 Rscript -e 'rmarkdown::render("analysis/comparison/semantic_exploration_comparison.Rmd")'
 Rscript -e 'rmarkdown::render("analysis/comparison/transience_uptake_and_scorer_checks.Rmd")'
+Rscript -e 'rmarkdown::render("analysis/comparison/robustness_checks.Rmd")'
 Rscript -e 'rmarkdown::render("analysis/human-ai/novelty.Rmd")'
 ```
 
@@ -48,6 +49,7 @@ in a notebook to drop the cross-model condition entirely.
 | Transience 2x2 table, within-HA context gain and uptake, scorer check | `comparison/transience_uptake_and_scorer_checks.Rmd` |
 | Semantic distance | `comparison/semantic_exploration_comparison.Rmd` |
 | Within-HA agent contrasts | `human-ai/novelty.Rmd` |
+| Robustness: shuffled context, lexical baselines, surface PERMANOVA | `comparison/robustness_checks.Rmd` |
 
 | Figure | Notebook |
 |---|---|
@@ -101,7 +103,8 @@ Two scripts are not part of the default pipeline:
   `config.yaml`).
 - `shuffled_context_control.py` computes the shuffled-context control reported
   in the paper (`google/gemma-4-12B`), locally or as a Hugging Face Job via
-  `launch_shuffled_context_control.py`.
+  `launch_shuffled_context_control.py`. Its output is included as
+  `data/human-ai/processed/shuffled_control_results.csv`.
 
 ## Valence measure
 

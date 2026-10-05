@@ -170,11 +170,5 @@ In the cross-model rows, a story counts once for each model that wrote in
 it, and the model is attributed per turn from `starter_side`, since the
 author columns are counterbalanced.
 
-# Not reproduced here
-
-The paper also reports a PERMANOVA on surface metrics (R^2 = 0.179), a
-length-controlled lexical-overlap test (0.052 vs 0.054, p = .53), a
-surface-novelty measure (rate of unused content words) and a shuffled-context
-control. Their exact specifications are not recoverable from the paper text,
-and the shuffled-context scores are not in the repository, so they are left
-out rather than approximated.
+The other robustness checks (shuffled context, lexical baselines, surface
+PERMANOVA) are in `robustness_checks.Rmd`.

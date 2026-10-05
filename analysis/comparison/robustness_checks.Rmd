@@ -1,0 +1,226 @@
+---
+title: "Robustness Checks"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+source(here::here("analysis/comparison/_comparison_utils.R"))
+pacman::p_load(vegan)
+```
+
+The robustness checks in the paper's *Robustness and Permutation* section.
+The scorer-familiarity check (AA stratified by model family) is in
+`transience_uptake_and_scorer_checks.Rmd`.
+
+# Shuffled context (Human-AI)
+
+Each HA turn is scored with no context ($s_{\text{base}}$), with its own
+story's context ($s_{\text{true}}$) and with the context of another, randomly
+assigned HA story ($s_{\text{shuffled}}$), using `google/gemma-4-12B`
+(`scripts/shuffled_context_control.py`). Gains are reductions in surprisal
+(bits/token): $G_{\text{true}} = s_{\text{base}} - s_{\text{true}}$,
+$G_{\text{shuffled}} = s_{\text{base}} - s_{\text{shuffled}}$ and
+$G_{\text{content}} = G_{\text{true}} - G_{\text{shuffled}}$. The scorer
+differs from the main analysis (`gemma-4-31B`), so these gains are compared
+with each other, not with the main novelty scores.
+
+```{r shuffled}
+shuffled <- read_csv(here("data/human-ai/processed/shuffled_control_results.csv"), show_col_types = FALSE)
+
+gains <- shuffled %>%
+  group_by(speaker) %>%
+  summarise(n_turns = n(), across(c(gain_true, gain_shuffled, gain_content), mean), .groups = "drop")
+
+gains %>%
+  knitr::kable(digits = 3, caption = "Mean surprisal gain by speaker (bits/token, all scored turns)")
+
+gap <- function(col) gains[[col]][gains$speaker == "ai"] - gains[[col]][gains$speaker == "human"]
+tibble(
+  gain = c("true", "shuffled", "content"),
+  ai_minus_human = c(gap("gain_true"), gap("gain_shuffled"), gap("gain_content"))
+) %>%
+  mutate(share_of_true_gap = ai_minus_human / gap("gain_true")) %>%
+  knitr::kable(digits = 3, caption = "AI - human gap in gain")
+
+per_story <- shuffled %>%
+  group_by(conversation_id, speaker) %>%
+  summarise(gain_content = mean(gain_content), .groups = "drop") %>%
+  pivot_wider(names_from = speaker, values_from = gain_content) %>%
+  drop_na(ai, human)
+
+test <- t.test(per_story$ai, per_story$human, paired = TRUE)
+cat(sprintf(
+  "Per-story paired t-test, G_content AI vs human: mean diff = %.3f, t(%d) = %.2f, p = %.2g\n",
+  unname(test$estimate), as.integer(test$parameter), unname(test$statistic), test$p.value
+))
+```
+
+# Simpler lexical and length baselines (Human-AI)
+
+Per turn, on content words (stopwords removed):
+
+- **new-word rate**: share of the turn's words not used earlier in the story
+- **lexical uptake**: overlap with the immediately preceding turn, as Jaccard
+  similarity and as echo-of-prior (share of the previous turn's words reused).
+  Echo-of-prior normalizes by the previous turn, so it does not grow with the
+  length of the current turn.
+- **turn length**: number of content words
+
+Each measure is averaged over human and over AI turns within a story and
+compared with a paired t-test (n = stories); $d_z$ is the standardized paired
+difference, human minus AI. Surprisal novelty (the paper's metric, turns with
+$1 < $ `analysis_turn` $\le 9$) is included for reference.
+
+```{r lexical}
+stopwords <- c(
+  "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "at", "for", "with", "as", "by", "from",
+  "is", "are", "was", "were", "be", "been", "being", "it", "its", "this", "that", "these", "those", "i", "you",
+  "he", "she", "they", "we", "him", "her", "them", "his", "their", "our", "my", "me", "your", "s", "t", "not",
+  "no", "so", "then", "than", "too", "very", "can", "will", "would", "could", "should", "had", "has", "have",
+  "do", "does", "did", "up", "out", "about", "into", "over", "after", "just", "who", "what", "when", "where",
+  "which", "there", "here", "all", "any", "some", "more", "most", "one", "like", "also", "only", "d", "re",
+  "ll", "m", "ve"
+)
+tokens <- function(x) {
+  w <- unlist(strsplit(tolower(gsub("[^a-z0-9' ]", " ", tolower(x))), " +"))
+  w <- w[w != ""]
+  w[!(w %in% stopwords)]
+}
+jaccard <- function(a, b) {
+  u <- length(union(a, b))
+  if (u == 0) NA_real_ else length(intersect(a, b)) / u
+}
+echo_of_prior <- function(cur, prev) if (length(prev) == 0) NA_real_ else length(intersect(cur, prev)) / length(prev)
+
+# Base read.csv keeps empty turns as "" rather than NA, as in the original analysis.
+ha <- read.csv(here("data/human-ai/processed/novelty_scores.csv"), stringsAsFactors = FALSE)
+ha$conversation_id <- clean_conversation_id(ha$conversation_id)
+complete <- tolower(as.character(ha$complete_exchange))
+ha <- ha[(is.na(ha$complete_exchange) | complete == "true") & !(ha$conversation_id %in% EXCLUDED_CONVERSATIONS), ]
+ha <- ha[order(ha$conversation_id, ha$turn), ]
+
+lexical <- do.call(rbind, lapply(unique(ha$conversation_id), function(cid) {
+  g <- ha[ha$conversation_id == cid, ]
+  stream <- list()
+  who <- character(0)
+  for (i in seq_len(nrow(g))) {
+    stream[[length(stream) + 1]] <- tokens(g$author_1[i]); who <- c(who, "H")
+    stream[[length(stream) + 1]] <- tokens(g$author_2[i]); who <- c(who, "A")
+  }
+  n <- length(stream)
+  new_rate <- jac <- echo <- len <- rep(NA_real_, n)
+  seen <- character(0)
+  for (i in seq_len(n)) {
+    cur <- stream[[i]]
+    len[i] <- length(cur)
+    if (i > 1 && length(cur) > 0) {
+      new_rate[i] <- mean(!(cur %in% seen))
+      jac[i] <- jaccard(cur, stream[[i - 1]])
+      echo[i] <- echo_of_prior(cur, stream[[i - 1]])
+    }
+    seen <- union(seen, cur)
+  }
+  data.frame(
+    conversation_id = cid,
+    h_newrate = mean(new_rate[who == "H"], na.rm = TRUE), a_newrate = mean(new_rate[who == "A"], na.rm = TRUE),
+    h_jac = mean(jac[who == "H"], na.rm = TRUE), a_jac = mean(jac[who == "A"], na.rm = TRUE),
+    h_echo = mean(echo[who == "H"], na.rm = TRUE), a_echo = mean(echo[who == "A"], na.rm = TRUE),
+    h_len = mean(len[who == "H"]), a_len = mean(len[who == "A"])
+  )
+}))
+
+window <- ha[!is.na(ha$analysis_turn) & ha$analysis_turn > 1 & ha$analysis_turn <= 9, ]
+novelty <- aggregate(cbind(author_1_surprise, author_2_surprise) ~ conversation_id, window, mean)
+names(novelty) <- c("conversation_id", "h_nov", "a_nov")
+lexical <- merge(lexical, novelty, by = "conversation_id")
+
+paired <- function(name, h, a) {
+  t <- t.test(h, a, paired = TRUE)
+  data.frame(measure = name, human = mean(h), ai = mean(a), dz = mean(h - a) / sd(h - a), p = t$p.value,
+             higher = ifelse(mean(h) > mean(a), "human", "AI"))
+}
+rbind(
+  paired("surprisal novelty (paper)", lexical$h_nov, lexical$a_nov),
+  paired("new-word rate", lexical$h_newrate, lexical$a_newrate),
+  paired("lexical uptake: Jaccard", lexical$h_jac, lexical$a_jac),
+  paired("lexical uptake: echo-of-prior", lexical$h_echo, lexical$a_echo),
+  paired("turn length (content words)", lexical$h_len, lexical$a_len)
+) %>%
+  knitr::kable(digits = c(0, 3, 3, 2, 4, 0), caption = sprintf("Human vs AI per story (n = %d)", nrow(lexical)))
+
+novelty_asym <- lexical$h_nov - lexical$a_nov
+convergence <- function(name, x) {
+  s <- suppressWarnings(cor.test(x, novelty_asym, method = "spearman"))
+  data.frame(asymmetry = name, spearman_rho = unname(s$estimate), p = s$p.value)
+}
+rbind(
+  convergence("new-word rate (human - AI)", lexical$h_newrate - lexical$a_newrate),
+  convergence("turn length (AI - human)", lexical$a_len - lexical$h_len)
+) %>%
+  knitr::kable(digits = 3, caption = "Correlation of simple asymmetries with the surprisal-novelty asymmetry across stories")
+```
+
+# Surface metrics PERMANOVA (HA, HH, AA)
+
+For five textdescriptives metrics, each story contributes the absolute
+difference between its two slot means, $A_m(i)$, over complete exchanges with
+$1 <$ `analysis_turn` $\le 9$. The five-dimensional $A$ vectors are compared
+across conditions with PERMANOVA (Euclidean, 9,999 permutations), and per
+metric with the planned HA vs (HH + AA)/2 contrast.
+
+```{r surface}
+surface_metrics <- c(
+  word_count = "n_tokens",
+  sentence_length = "sentence_length_mean",
+  lexical_diversity = "proportion_unique_tokens",
+  readability = "flesch_reading_ease",
+  coherence = "first_order_coherence"
+)
+
+surface <- load_surface_metrics(PUBLISHED_CONDITIONS) %>%
+  filter_complete_exchange_window() %>%
+  filter(turn_index > 1) %>%
+  prepare_condition_factor(reference = "human-ai") %>%
+  filter(!conversation_id %in% c("conv_ed575a06c11d42358e3eeb7826d2f959", "conv_a63a08273d0a4704a7638e4cd6850225")) %>%
+  filter(speaker_slot %in% c("author_1", "author_2")) %>%
+  mutate(slot = factor(speaker_slot, levels = c("author_1", "author_2"), labels = c("Slot 1", "Slot 2")))
+
+surface_A <- purrr::imap_dfr(surface_metrics, function(column, metric) {
+  surface %>%
+    select(condition, conversation_id, slot, value = all_of(column)) %>%
+    group_by(condition, conversation_id, slot) %>%
+    summarise(side_mean = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = slot, values_from = side_mean) %>%
+    drop_na(`Slot 1`, `Slot 2`) %>%
+    transmute(metric, condition, conversation_id, A = abs(`Slot 1` - `Slot 2`))
+})
+
+surface_A %>%
+  group_by(metric, condition) %>%
+  summarise(n = n(), mean_A = mean(A), median_A = median(A), .groups = "drop") %>%
+  knitr::kable(digits = 3, caption = "Per-story slot asymmetry A_m by condition")
+
+surface_A %>%
+  group_by(metric) %>%
+  group_modify(~ planned_contrast_HA_vs_same(.x, "A")) %>%
+  ungroup() %>%
+  mutate(p_BH = p.adjust(p, method = "BH")) %>%
+  select(metric, estimate, ci_lower, ci_upper, p, p_BH) %>%
+  knitr::kable(digits = 3, caption = "Planned contrast HA vs (HH + AA)/2 per metric, BH-adjusted across metrics")
+
+A_matrix <- surface_A %>%
+  pivot_wider(id_cols = c(conversation_id, condition), names_from = metric, values_from = A) %>%
+  drop_na()
+cat(sprintf("Stories with all %d metrics: %d\n", length(surface_metrics), nrow(A_matrix)))
+
+set.seed(42)
+adonis2(
+  as.matrix(select(A_matrix, -conversation_id, -condition)) ~ condition,
+  data = A_matrix, method = "euclidean", permutations = 9999
+)
+```
