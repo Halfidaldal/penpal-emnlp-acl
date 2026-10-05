@@ -1,0 +1,322 @@
+---
+title: "Novelty, Transience and Resonance in Human-AI Stories"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+---
+
+## Summary
+
+- Humans produce higher novelty (surprisal) and higher transience than the model, indicating stronger deviations from earlier story context.
+- Both agents display a positive novelty–resonance relationship (innovation bias), but the slope is steeper for humans.
+- This indicates that surprising human turns exert greater forward influence on narrative development.
+- AI contributions show lower variance and lower informational impact relative to human inputs.
+- Humans are the primary drivers of narrative innovation and thematic redirection.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+
+pacman::p_load(tidyverse, lme4, lmerTest, here, emmeans)
+
+theme_set(theme_minimal(base_size = 14))
+GRAPHS_DIR <- here("analysis", "figures")
+dir.create(GRAPHS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+EXCLUDED_CONVERSATIONS <- c(
+  "conv_0bb56093-3033-4615-bb70-ebfa4135589a",
+  "conv_0f18b30f-7d4b-4681-b98e-a0ff4f2b5256",
+  "conv_72218cb5-e59c-4c93-a4b9-a057fe5dad80",
+  "conv_7c23347e-6172-4c84-9fd0-45ef34290bd5",
+  "conv_ed575a06c11d42358e3eeb7826d2f959",
+  "conv_a63a08273d0a4704a7638e4cd6850225"
+)
+```
+
+# 1. Data Loading and Preprocessing
+
+## 1.1 Load Data
+
+```{r load-data}
+df_res_field <- read_csv(here("data/human-ai/processed/novelty_scores.csv")) %>%
+  rename(
+    user = author_1,
+    ai = author_2,
+    user_surprise = author_1_surprise,
+    ai_surprise = author_2_surprise,
+    user_transience = author_1_transience,
+    ai_transience = author_2_transience
+  ) %>%
+  filter(!is.na(user_surprise) & !is.na(ai_surprise)) %>%
+  mutate(
+    user_resonance = user_surprise - user_transience,
+    ai_resonance = ai_surprise - ai_transience,
+    datatype = "Field"
+  ) %>%
+  drop_na(user, ai) %>%
+  filter(!conversation_id %in% EXCLUDED_CONVERSATIONS, turn > 1)
+```
+
+## 1.2 Reshape Data
+
+```{r reshape-data}
+df_res_field <- df_res_field %>%
+  mutate(
+    user_nwords = str_count(user, "\\S+"),
+    ai_nwords = str_count(ai, "\\S+")
+  )
+
+df_res_long <- df_res_field %>%
+  pivot_longer(
+    cols = c(user_surprise, user_transience, user_nwords,
+             ai_surprise, ai_transience, ai_nwords),
+    names_to = c("agent", "metric"),
+    names_pattern = "(user|ai)_(surprise|transience|nwords)"
+  ) %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  mutate(
+    resonance = surprise - transience,
+    agent = factor(agent, levels = c("user", "ai"), labels = c("User", "LLM"))
+  )
+```
+
+## 1.3 Descriptive Statistics
+
+```{r descriptive-stats}
+desc_stats <- df_res_long %>%
+  group_by(agent) %>%
+  summarise(
+    n = n(),
+    mean_surprise = mean(surprise, na.rm = TRUE),
+    sd_surprise = sd(surprise, na.rm = TRUE),
+    mean_transience = mean(transience, na.rm = TRUE),
+    sd_transience = sd(transience, na.rm = TRUE),
+    mean_resonance = mean(resonance, na.rm = TRUE),
+    sd_resonance = sd(resonance, na.rm = TRUE)
+  )
+
+print(desc_stats)
+
+knitr::kable(desc_stats, caption = "Descriptive Statistics for Novelty Metrics by Agent", digits = 3)
+```
+
+```{r metric-distribution-stack, fig.width=7.5, fig.height=3.2}
+agent_colors <- c("User" = "#377EB8", "LLM" = "#FF7F00")
+
+df_metric_distributions <- df_res_long %>%
+  select(agent, surprise, transience, resonance) %>%
+  pivot_longer(
+    cols = c(surprise, transience, resonance),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("surprise", "transience", "resonance"),
+      labels = c("Novelty", "Transience", "Resonance")
+    )
+  )
+
+metric_summary <- df_metric_distributions %>%
+  group_by(metric, agent) %>%
+  summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_metric_distributions <- ggplot(
+  df_metric_distributions,
+  aes(x = agent, y = value, fill = agent)
+) +
+  geom_violin(alpha = 0.4, colour = NA, trim = FALSE, na.rm = TRUE) +
+  geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.9, na.rm = TRUE) +
+  facet_wrap(~ metric, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = agent_colors, name = NULL) +
+  scale_color_manual(values = agent_colors, name = NULL) +
+  labs(
+    title = "Novelty Metrics by Agent",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 10),
+    plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+print(p_metric_distributions)
+
+ggsave(
+  file.path(GRAPHS_DIR, "Novelty_Transience_Resonance_Distributions_Agent.png"),
+  p_metric_distributions,
+  width = 7.5,
+  height = 3.2,
+  dpi = 300
+)
+```
+
+
+# 2. Novelty and Resonance Analysis
+
+## 2.1 Resonance vs Novelty Plot
+
+```{r resonance-plot, fig.width=12, fig.height=6}
+p_resonance <- ggplot(df_res_long, aes(x = surprise, y = resonance, color = agent)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, fullrange = TRUE, size = 1.2) +
+  scale_color_manual(values = c("User" = "#377EB8", "LLM" = "#FF7F00")) +
+  geom_vline(data = desc_stats,
+             aes(xintercept = mean_surprise, color = agent),
+             linetype = "dashed", linewidth = 0.8, show.legend = FALSE) +
+  labs(
+    title = "Resonance vs Novelty (Field Data)",
+    x = "Novelty",
+    y = "Resonance (Novelty - Transience)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top") + xlim(-5, 1)
+
+print(p_resonance)
+
+ggsave(file.path(GRAPHS_DIR, "novelty_resonance_vs_novelty.png"),
+       p_resonance, width = 12, height = 6, dpi = 300)
+```
+
+## 2.2 Transience vs Novelty Plot
+
+```{r transience-plot, fig.width=12, fig.height=6}
+p_transience <- ggplot(df_res_long, aes(x = surprise, y = transience, color = agent)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, fullrange = TRUE, size = 1.2) +
+  scale_color_manual(values = c("User" = "#377EB8", "LLM" = "#FF7F00")) +
+  geom_vline(data = desc_stats,
+             aes(xintercept = mean_surprise, color = agent),
+             linetype = "dashed", linewidth = 0.8, show.legend = FALSE) +
+  labs(
+    title = "Transience vs Novelty (Field Data)",
+    x = "Novelty (Surprisal)",
+    y = "Transience"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+print(p_transience)
+
+ggsave(file.path(GRAPHS_DIR, "novelty_transience_vs_novelty.png"),
+       p_transience, width = 12, height = 6, dpi = 300)
+```
+
+# 3. Statistical Models
+
+## 3.1 Resonance Model
+
+```{r resonance-model}
+model_resonance <- lmer(resonance ~ surprise * agent + (1 | conversation_id), data = df_res_long)
+cat("=== Resonance Model ===\n")
+print(summary(model_resonance)$coefficients)
+
+cat("\n=== Slope Comparison (Resonance) ===\n")
+print(emtrends(model_resonance, specs = "agent", var = "surprise"))
+
+model_resonance_len <- lmer(resonance ~ surprise * agent + nwords + (1 | conversation_id), data = df_res_long)
+cat("\n=== Resonance Model (controlling for turn length) ===\n")
+print(summary(model_resonance_len)$coefficients)
+
+cat("\n=== Slope Comparison (Resonance, length-controlled) ===\n")
+print(emtrends(model_resonance_len, specs = "agent", var = "surprise"))
+```
+
+## 3.2 Transience Model
+
+```{r transience-model}
+model_transience <- lmer(transience ~ surprise * agent + (1 | conversation_id), data = df_res_long)
+
+cat("=== Transience Model ===\n")
+print(summary(model_transience)$coefficients)
+
+cat("\n=== Slope Comparison (Transience) ===\n")
+print(emtrends(model_transience, specs = "agent", var = "surprise"))
+
+model_transience_len <- lmer(transience ~ surprise * agent + nwords + (1 | conversation_id), data = df_res_long)
+
+cat("\n=== Transience Model (controlling for turn length) ===\n")
+print(summary(model_transience_len)$coefficients)
+
+cat("\n=== Slope Comparison (Transience, length-controlled) ===\n")
+print(emtrends(model_transience_len, specs = "agent", var = "surprise"))
+```
+
+# 4. Supplementary: Resonance vs Novelty by LLM Type
+
+```{r llm-resonance-novelty, fig.width=12, fig.height=6}
+desc_stats_llm <- df_res_long %>%
+  filter(!is.na(llm_type)) %>%
+  group_by(agent, llm_type) %>%
+  summarise(mean_surprise = mean(surprise, na.rm = TRUE), .groups = "drop")
+
+p_llm_user <- df_res_long %>%
+  filter(!is.na(llm_type), agent == "User") %>%
+  ggplot(aes(x = surprise, y = resonance, color = factor(llm_type))) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  geom_vline(data = desc_stats_llm %>% filter(agent == "User"),
+             aes(xintercept = mean_surprise, color = factor(llm_type)),
+             linetype = "dashed", linewidth = 0.8, show.legend = FALSE) +
+  labs(
+    title  = "User: Resonance vs Novelty by LLM Type",
+    x      = "Novelty",
+    y      = "Resonance (Novelty − Transience)",
+    color  = "LLM Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_llm_ai <- df_res_long %>%
+  filter(!is.na(llm_type), agent == "LLM") %>%
+  ggplot(aes(x = surprise, y = resonance, color = factor(llm_type))) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  geom_vline(data = desc_stats_llm %>% filter(agent == "LLM"),
+             aes(xintercept = mean_surprise, color = factor(llm_type)),
+             linetype = "dashed", linewidth = 0.8, show.legend = FALSE) +
+  labs(
+    title  = "LLM: Resonance vs Novelty by LLM Type",
+    x      = "Novelty",
+    y      = "Resonance (Novelty − Transience)",
+    color  = "LLM Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p_llm_user)
+print(p_llm_ai)
+
+ggsave(file.path(GRAPHS_DIR, "novelty_resonance_llm_type_user.png"),
+       p_llm_user, width = 12, height = 6, dpi = 300)
+ggsave(file.path(GRAPHS_DIR, "novelty_resonance_llm_type_ai.png"),
+       p_llm_ai, width = 12, height = 6, dpi = 300)
+```
+
+# 5. Session Information
+
+```{r session-info}
+sessionInfo()
+```

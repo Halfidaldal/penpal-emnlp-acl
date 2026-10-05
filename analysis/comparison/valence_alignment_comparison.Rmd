@@ -1,0 +1,736 @@
+---
+title: "Valence Alignment Across Conditions"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+
+source(here::here("analysis/comparison/_comparison_utils.R"))
+CONDITIONS <- ALL_CONDITIONS  # or PUBLISHED_CONDITIONS for the three-condition paper set
+
+GRAPHS_DIR <- file.path(PROJECT_ROOT, "analysis", "figures")
+dir.create(GRAPHS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+pacman::p_load(lme4, lmerTest, patchwork, emmeans)
+
+theme_set(theme_comparison())
+```
+
+This notebook compares **valence alignment** across conditions. `author_1` / `author_2` are the two slots of each exchange; only in Human-AI do they map onto fixed roles (human / AI). The analysis window is complete exchanges with `analysis_turn` 1 to 9.
+
+**Primary alignment object.** Each story contributes one unsigned, label-invariant dyad asymmetry magnitude:
+$$A_{\text{valence}}(i) \;=\; \bigl|\, \operatorname{atanh}(r_{\text{first}\to \text{second},i}) - \operatorname{atanh}(r_{\text{second}\to \text{first},i}) \,\bigr|$$
+where $r_{\text{first}\to \text{second},i}$ is the per-story Pearson correlation between same-row chronological first and second turns, and $r_{\text{second}\to \text{first},i}$ is the correlation between the previous row's chronological second turn and the current row's chronological first turn. The directional-slope LMMs are supplemental views.
+
+**Local immediate-adaptation object.** We also compute an unsigned exchange-level asymmetry measure. For each exchange, the two local coupling contributions are $c_{\text{first}\to\text{second},t}=z_{\text{predictor}}z_{\text{response}}$ and $c_{\text{second}\to\text{first},t}=z_{\text{predictor}}z_{\text{response}}$ under the two directional pairing rules. The local asymmetry score is
+$$A_{\text{local}}(t) \;=\; \bigl|\, c_{\text{first}\to\text{second},t} - c_{\text{second}\to\text{first},t} \,\bigr|.$$
+This treats asymmetry as an exchange-level magnitude of unequal immediate adaptation, while the mixed model accounts for exchanges nested within stories.
+
+**Primary baseline-valence object.** Before the alignment analysis, we also test agent-side baseline valence asymmetry. Each story contributes one unsigned baseline gap:
+$$A_{\text{baseline}}(i) \;=\; \bigl|\, \bar{v}_{\text{slot 1},i} - \bar{v}_{\text{slot 2},i} \,\bigr|$$
+where $\bar{v}_{\text{slot 1},i}$ and $\bar{v}_{\text{slot 2},i}$ are the mean projected valence scores for the two sides of story $i$. This is a baseline-level difference, not a turn-by-turn adaptation measure.
+
+Signed directional models are diagnostic only: outside Human-AI, chronological first / second reflects starter side rather than agent identity.
+
+# Load Data
+
+```{r load-data}
+df_combined <- load_valence_data(CONDITIONS) %>%
+  filter_complete_exchange_window() %>%
+  prepare_condition_factor(reference = "human-ai") %>%
+  add_chronological_valence() %>%
+  filter(!conversation_id %in% EXCLUDED_CONVERSATIONS, author_2 != "Network error while generating a response.")
+
+df_combined %>%
+  group_by(condition) %>%
+  summarise(
+    n_stories = n_distinct(conversation_id),
+    n_turns = n(),
+    min_turn = min(turn_index, na.rm = TRUE),
+    max_turn = max(turn_index, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    caption = "Loaded exchange-aligned valence data by condition"
+  )
+```
+
+# Primary Baseline Valence Asymmetry
+
+This section tests whether the two sides of a story differ in their average valence baseline. The signed slot gap is only role-interpretable in Human-AI; for the cross-condition comparison, the unsigned per-story gap $A_{\text{baseline}}$ is the main quantity.
+
+```{r baseline-asymmetry}
+df_baseline_story <- df_combined %>%
+  group_by(condition, conversation_id) %>%
+  summarise(
+    n_exchanges = sum(!is.na(author_1_valence) & !is.na(author_2_valence)),
+    slot_1_baseline = mean(author_1_valence, na.rm = TRUE),
+    slot_2_baseline = mean(author_2_valence, na.rm = TRUE),
+    story_baseline = mean(c(author_1_valence, author_2_valence), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    baseline_gap = slot_1_baseline - slot_2_baseline,
+    A_baseline = abs(baseline_gap)
+  ) %>%
+  drop_na(A_baseline, story_baseline)
+
+df_baseline_story %>%
+  group_by(condition) %>%
+  summarise(
+    n_stories = n(),
+    mean_A_baseline = mean(A_baseline),
+    sd_A_baseline = sd(A_baseline),
+    median_A_baseline = median(A_baseline),
+    mean_signed_gap = mean(baseline_gap),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Per-story baseline valence asymmetry by condition"
+  )
+```
+
+```{r baseline-asymmetry-tests}
+cat("One-way ANOVA: A_baseline ~ condition\n")
+print(summary(aov(A_baseline ~ condition, data = df_baseline_story)))
+
+cat("\nKruskal-Wallis (robust): A_baseline ~ condition\n")
+print(kruskal.test(A_baseline ~ condition, data = df_baseline_story))
+
+cat("\nPairwise Wilcoxon (BH-adjusted):\n")
+print(pairwise.wilcox.test(
+  df_baseline_story$A_baseline,
+  df_baseline_story$condition,
+  p.adjust.method = "BH"
+))
+```
+
+```{r baseline-asymmetry-plot, fig.width=9, fig.height=5}
+p_baseline_asym <- ggplot(df_baseline_story, aes(x = condition, y = A_baseline, fill = condition)) +
+  geom_violin(alpha = 0.55, trim = FALSE) +
+  geom_boxplot(width = 0.18, alpha = 0.85, outlier.alpha = 0.15) +
+  geom_jitter(width = 0.08, alpha = 0.35, size = 1.4) +
+  scale_fill_manual(values = condition_colors) +
+  labs(
+    title = "Per-story baseline valence asymmetry by condition",
+    subtitle = "A_baseline(i) = |mean(slot_1_valence) - mean(slot_2_valence)|",
+    x = "Condition",
+    y = "Baseline valence asymmetry"
+  ) +
+  theme(legend.position = "none")
+
+print(p_baseline_asym)
+ggsave(
+  file.path(GRAPHS_DIR, "valence_baseline_asymmetry_per_story.png"),
+  p_baseline_asym,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r baseline-effects}
+bootstrap_condition_means(df_baseline_story, "A_baseline", R = 10000) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Bootstrap 95% CI on per-condition mean of A_baseline (R = 10,000)"
+  )
+
+effect_sizes_pairwise(df_baseline_story, "A_baseline") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Pairwise Cliff's delta on A_baseline"
+  )
+
+planned_contrast_HA_vs_same(df_baseline_story, "A_baseline") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Planned contrast: A_baseline in HA vs the average of HH and AA"
+  )
+```
+
+# Condition Baseline Valence
+
+This plot shows overall valence baseline by condition, pooling turn-level valence scores across both slots. It is not an asymmetry measure; it asks whether the conditions differ in overall emotional tone.
+
+```{r condition-baseline-plot, fig.width=9, fig.height=5}
+df_condition_valence <- df_combined %>%
+  select(condition, conversation_id, turn_index, author_1_valence, author_2_valence) %>%
+  pivot_longer(
+    cols = c(author_1_valence, author_2_valence),
+    names_to = "slot",
+    values_to = "valence"
+  ) %>%
+  drop_na(valence)
+
+p_condition_baseline <- ggplot(df_condition_valence, aes(x = valence, fill = condition)) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(values = condition_colors) +
+  labs(
+    title = "Condition-level valence baseline",
+    subtitle = "Turn-level valence scores pooled across both slots",
+    x = "Projected valence",
+    y = "Density"
+  ) +
+  theme(legend.position = "bottom")
+
+print(p_condition_baseline)
+ggsave(
+  file.path(GRAPHS_DIR, "valence_condition_baseline_density.png"),
+  p_condition_baseline,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Preprocessing
+
+```{r preprocess}
+df_analysis <- df_combined %>%
+  group_by(conversation_id, condition) %>%
+  arrange(turn_index, .by_group = TRUE) %>%
+  mutate(
+    second_valence_lag1 = lag(second_valence)
+  ) %>%
+  ungroup() %>%
+  filter(turn_index > 1) %>%
+  drop_na(
+    first_valence, second_valence, second_valence_lag1
+  )
+
+df_alignment_long <- bind_rows(
+  df_analysis %>%
+    transmute(
+      conversation_id,
+      condition,
+      turn_index,
+      alignment_direction = "first_to_second",
+      predictor_valence = first_valence,
+      response_valence = second_valence
+    ),
+  df_analysis %>%
+    transmute(
+      conversation_id,
+      condition,
+      turn_index,
+      alignment_direction = "second_to_first",
+      predictor_valence = second_valence_lag1,
+      response_valence = first_valence
+    )
+) %>%
+  mutate(
+    alignment_direction = factor(
+      alignment_direction,
+      levels = c("first_to_second", "second_to_first"),
+      labels = c("First → Second", "Second(t-1) → First")
+    )
+  )
+
+df_std <- df_alignment_long %>%
+  group_by(conversation_id, alignment_direction) %>%
+  mutate(
+    predictor_z = as.numeric(scale(predictor_valence)),
+    response_z = as.numeric(scale(response_valence))
+  ) %>%
+  ungroup() %>%
+  drop_na(predictor_z, response_z)
+
+contrasts(df_std$alignment_direction) <- contr.sum(2)
+
+cat("Analysis rows:", nrow(df_std), "\n")
+cat("Stories:", n_distinct(df_std$conversation_id), "\n")
+```
+
+# Descriptive Checks
+
+```{r descriptives}
+df_analysis %>%
+  group_by(condition) %>%
+  summarise(
+    n_stories = n_distinct(conversation_id),
+    n_turns = n(),
+    slot_1_mean = mean(author_1_valence, na.rm = TRUE),
+    slot_2_mean = mean(author_2_valence, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Mean projected valence by condition"
+  )
+```
+
+```{r valence-distributions, fig.width=12, fig.height=4}
+p_slot1 <- df_analysis %>%
+  ggplot(aes(x = author_1_valence, fill = condition)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = condition_colors) +
+  labs(title = "Slot 1 Valence", x = "Projected Valence", y = "Density") +
+  theme(legend.position = "none")
+
+p_slot2 <- df_analysis %>%
+  ggplot(aes(x = author_2_valence, fill = condition)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = condition_colors) +
+  labs(title = "Slot 2 Valence", x = "Projected Valence", y = "Density")
+
+slot_combined <- p_slot1 + p_slot2 + plot_layout(guides = "collect")
+print(slot_combined)
+ggsave(
+  file.path(GRAPHS_DIR, "valence_slot_distributions.png"),
+  slot_combined,
+  width = 12,
+  height = 4,
+  dpi = 300
+)
+```
+
+# Directional Valence Alignment by Condition
+
+The figure below visualizes responder valence as a function of partner valence under the two exchange-aligned pairing rules. In Human-AI, the directions map onto Human $\rightarrow$ AI and AI $\rightarrow$ Human response patterns. In Human-Human and AI-AI, they should be interpreted as chronological exchange positions rather than stable agent identities.
+
+```{r directional-alignment-three-panel-summary}
+df_alignment_long %>%
+  group_by(condition, alignment_direction) %>%
+  summarise(
+    n_pairs = sum(!is.na(predictor_valence) & !is.na(response_valence)),
+    slope = if (n_pairs >= 3) {
+      coef(lm(response_valence ~ predictor_valence))[2]
+    } else {
+      NA_real_
+    },
+    intercept = if (n_pairs >= 3) {
+      coef(lm(response_valence ~ predictor_valence))[1]
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Pooled descriptive slopes for responder valence predicted by partner valence"
+  )
+```
+
+```{r directional-alignment-three-panel-plot, fig.width=12, fig.height=4.8}
+p_directional_alignment_comparison <- df_alignment_long %>%
+  drop_na(predictor_valence, response_valence) %>%
+  ggplot(aes(
+    x = predictor_valence,
+    y = response_valence,
+    color = alignment_direction
+  )) +
+  geom_point(alpha = 0.18, size = 0.9) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.05, fullrange = TRUE) +
+  facet_wrap(~ condition, nrow = 1) +
+  scale_color_manual(
+    values = c("First \u2192 Second" = "#377EB8", "Second(t-1) \u2192 First" = "#FF7F00"),
+    name = "Direction"
+  ) +
+  labs(
+    title = "Directional valence alignment by condition",
+    subtitle = "Responder valence predicted by current or previous partner valence",
+    x = "Partner valence",
+    y = "Responder valence"
+  ) +
+  theme(legend.position = "bottom")
+
+print(p_directional_alignment_comparison)
+ggsave(
+  file.path(GRAPHS_DIR, "directional_valence_alignment_comparison_three_panel.png"),
+  p_directional_alignment_comparison,
+  width = 12,
+  height = 4.8,
+  dpi = 300
+)
+```
+
+# Local Exchange-Level Alignment Asymmetry
+
+This section treats immediate asymmetry as local to an exchange. Each directional pair contributes a standardized local coupling term, $z_{\text{predictor}}z_{\text{response}}$. The local asymmetry score is the absolute difference between the two directional coupling contributions around the same exchange index. This keeps the measure unsigned, so it does not depend on which slot or direction is larger.
+
+```{r local-exchange-asymmetry}
+direction_levels <- levels(df_std$alignment_direction)
+
+df_local_asym <- df_std %>%
+  mutate(
+    direction_key = case_when(
+      as.character(alignment_direction) == direction_levels[[1]] ~ "first_to_second",
+      as.character(alignment_direction) == direction_levels[[2]] ~ "second_to_first",
+      TRUE ~ NA_character_
+    ),
+    local_coupling = predictor_z * response_z
+  ) %>%
+  select(condition, conversation_id, turn_index, direction_key, local_coupling) %>%
+  drop_na(direction_key, local_coupling) %>%
+  pivot_wider(
+    names_from = direction_key,
+    values_from = local_coupling
+  ) %>%
+  drop_na(first_to_second, second_to_first) %>%
+  mutate(
+    signed_local_diff = first_to_second - second_to_first,
+    A_local = abs(signed_local_diff)
+  )
+
+df_local_asym %>%
+  group_by(condition) %>%
+  summarise(
+    n_stories = n_distinct(conversation_id),
+    n_exchanges = n(),
+    mean_A_local = mean(A_local),
+    sd_A_local = sd(A_local),
+    median_A_local = median(A_local),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Local exchange-level alignment asymmetry by condition"
+  )
+```
+
+```{r local-exchange-asymmetry-model}
+model_local_asym <- lmer(
+  A_local ~ condition + (1 | conversation_id),
+  data = df_local_asym
+)
+
+cat("=== Local exchange-level asymmetry model ===\n")
+print(summary(model_local_asym)$coefficients)
+
+local_condition_emm <- emmeans(model_local_asym, specs = "condition")
+
+local_condition_emm %>%
+  as.data.frame() %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Estimated marginal mean local asymmetry by condition"
+  )
+
+pairs(local_condition_emm, adjust = "BH") %>%
+  as.data.frame() %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Pairwise condition contrasts for local exchange-level asymmetry"
+  )
+
+contrast(
+  local_condition_emm,
+  method = list(
+    "Human-AI vs same-type average" = condition_weights(local_condition_emm, HA_VS_SAME_TYPE)
+  ),
+  adjust = "none"
+) %>%
+  as.data.frame() %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Planned contrast: local exchange-level asymmetry in HA vs the average of HH and AA"
+  )
+```
+
+```{r local-exchange-asymmetry-plot, fig.width=9, fig.height=5}
+p_local_asym <- ggplot(df_local_asym, aes(x = condition, y = A_local, fill = condition)) +
+  geom_violin(alpha = 0.45, colour = NA) +
+  geom_boxplot(width = 0.18, alpha = 0.85, outlier.alpha = 0.08) +
+  scale_fill_manual(values = condition_colors) +
+  labs(
+    title = "Local exchange-level valence-alignment asymmetry",
+    subtitle = "A_local(t) = |coupling_first_to_second - coupling_second_to_first|",
+    x = "Condition",
+    y = "Local asymmetry"
+  ) +
+  theme(legend.position = "none")
+
+print(p_local_asym)
+ggsave(
+  file.path(GRAPHS_DIR, "valence_local_exchange_asymmetry.png"),
+  p_local_asym,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Primary: Per-Story Asymmetry Magnitude
+
+The three-panel figure suggests that the two directional slopes may differ most strongly in Human-AI. The mixed model below tests that visual pattern directly by estimating whether the predictor-valence slope differs by direction and whether that directional slope gap changes by condition. This is a pooled turn-level model with story-level random intercepts; the per-story $A_{\text{valence}}$ analysis that follows is the story-level robustness layer.
+
+```{r directional-slope-interaction-model}
+model_direction_condition <- lmer(
+  response_z ~ predictor_z * alignment_direction * condition + (1 | conversation_id),
+  data = df_std
+)
+
+cat("=== Direction x condition slope-interaction model ===\n")
+print(summary(model_direction_condition)$coefficients)
+
+directional_slopes <- emtrends(
+  model_direction_condition,
+  specs = c("condition", "alignment_direction"),
+  var = "predictor_z"
+)
+
+directional_slopes %>%
+  as.data.frame() %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Estimated predictor-valence slopes by condition and direction"
+  )
+
+direction_gap_by_condition <- contrast(
+  directional_slopes,
+  method = list("First_to_second_minus_second_to_first" = c(1, -1)),
+  by = "condition"
+)
+
+direction_gap_by_condition %>%
+  as.data.frame() %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Within-condition directional slope gap"
+  )
+```
+
+```{r directional-slope-gap-condition-contrasts}
+direction_gap_slopes <- contrast(
+  directional_slopes,
+  method = list("First_to_second_minus_second_to_first" = c(1, -1)),
+  by = "condition"
+)
+
+contrast(
+  direction_gap_slopes,
+  method = list(
+    "Human-AI vs Human-Human" = condition_weights(direction_gap_slopes, c("Human-AI" = 1, "Human-Human" = -1)),
+    "Human-AI vs AI-AI" = condition_weights(direction_gap_slopes, c("Human-AI" = 1, "AI-AI" = -1)),
+    "Human-AI vs same-type average" = condition_weights(direction_gap_slopes, HA_VS_SAME_TYPE)
+  ),
+  by = NULL,
+  adjust = "none"
+) %>%
+  as.data.frame() %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Cross-condition contrasts of the directional slope gap"
+  )
+```
+
+```{r primary-asymmetry}
+# Per-story Pearson correlations under both pairing rules, on non-standardized
+# predictor/response pairs (r is scale-invariant).
+min_pairs <- 3
+
+df_r12 <- df_alignment_long %>%
+  filter(alignment_direction == "First \u2192 Second") %>%
+  group_by(conversation_id, condition) %>%
+  summarise(
+    n_pairs = sum(!is.na(predictor_valence) & !is.na(response_valence)),
+    r = if (n_pairs >= min_pairs) {
+      suppressWarnings(cor(predictor_valence, response_valence, use = "complete.obs"))
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  transmute(conversation_id, condition, n_pairs_12 = n_pairs, r_12 = r)
+
+df_r21 <- df_alignment_long %>%
+  filter(alignment_direction == "Second(t-1) \u2192 First") %>%
+  group_by(conversation_id, condition) %>%
+  summarise(
+    n_pairs = sum(!is.na(predictor_valence) & !is.na(response_valence)),
+    r = if (n_pairs >= min_pairs) {
+      suppressWarnings(cor(predictor_valence, response_valence, use = "complete.obs"))
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  transmute(conversation_id, condition, n_pairs_21 = n_pairs, r_21 = r)
+
+df_asym <- df_r12 %>%
+  inner_join(df_r21, by = c("conversation_id", "condition")) %>%
+  mutate(
+    # Clamp |r| < 1 so atanh stays finite
+    r_12_c = pmin(pmax(r_12, -0.999999), 0.999999),
+    r_21_c = pmin(pmax(r_21, -0.999999), 0.999999),
+    z_12 = atanh(r_12_c),
+    z_21 = atanh(r_21_c),
+    signed_z_diff = z_12 - z_21,
+    A_valence = abs(signed_z_diff)
+  ) %>%
+  filter(!is.na(A_valence))
+
+cat("Stories with both directional correlations available:\n")
+df_asym %>%
+  count(condition) %>%
+  knitr::kable(caption = "Per-story A_valence sample sizes by condition")
+
+stopifnot(all(df_asym$A_valence >= 0))
+```
+
+```{r primary-asymmetry-descriptives}
+df_asym %>%
+  group_by(condition) %>%
+  summarise(
+    n = n(),
+    mean_A = mean(A_valence),
+    sd_A = sd(A_valence),
+    median_A = median(A_valence),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Per-story |Fisher-z asymmetry| by condition"
+  )
+```
+
+```{r primary-asymmetry-test}
+cat("One-way ANOVA: A_valence ~ condition\n")
+print(summary(aov(A_valence ~ condition, data = df_asym)))
+
+cat("\nKruskal-Wallis (robust): A_valence ~ condition\n")
+print(kruskal.test(A_valence ~ condition, data = df_asym))
+
+cat("\nPairwise Wilcoxon (BH-adjusted):\n")
+print(pairwise.wilcox.test(
+  df_asym$A_valence,
+  df_asym$condition,
+  p.adjust.method = "BH"
+))
+```
+
+```{r primary-asymmetry-plot, fig.width=9, fig.height=5}
+p_asym <- ggplot(df_asym, aes(x = condition, y = A_valence, fill = condition)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.9) +
+  geom_jitter(width = 0.08, alpha = 0.35, size = 0.9) +
+  scale_fill_manual(values = condition_colors) +
+  labs(
+    title = "Per-story valence alignment asymmetry by condition",
+    subtitle = "A_valence(i) = |atanh(r_first_to_second) - atanh(r_second_to_first)|",
+    x = "Condition",
+    y = expression("|" * Delta * z * "|")
+  ) +
+  theme(legend.position = "none")
+
+print(p_asym)
+ggsave(
+  file.path(GRAPHS_DIR, "valence_asymmetry_per_story.png"),
+  p_asym,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Bootstrap CIs and Effect Sizes on `A_valence`
+
+```{r boot-effects-valence}
+boot_A <- bootstrap_condition_means(df_asym, "A_valence", R = 10000)
+boot_A %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Bootstrap 95% CI on per-condition mean of A_valence (R = 10,000)"
+  )
+
+effect_sizes_pairwise(df_asym, "A_valence") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Pairwise Cliff's delta on A_valence"
+  )
+```
+
+# Planned Contrast: HA vs (HH + AA)/2
+
+```{r planned-contrast-valence}
+planned_contrast_HA_vs_same(df_asym, "A_valence") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Planned contrast: A_valence in HA vs the average of HH and AA"
+  )
+```
+
+# Directional Stability of Signed Valence Asymmetry
+
+Tests whether the *direction* of the chronological first vs second alignment difference is
+consistent across stories within each condition. The signed quantity is
+$\text{signed}_i = \operatorname{atanh}(r_{\text{first}\to \text{second},i}) - \operatorname{atanh}(r_{\text{second}\to \text{first},i})$.
+HA-specific identity-tied directionality predicts high `stability` and
+`sign_consistency` in HA, low in HH and AA, even when unsigned `A_valence`
+is similar.
+
+```{r directional-stability-valence}
+ds_val <- directional_stability(df_asym, "signed_z_diff")
+ds_val$by_condition %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Per-condition directional stability of signed valence asymmetry"
+  )
+
+cat(sprintf(
+  "Brown-Forsythe variance-equality p = %.4f\n", ds_val$variance_equality_p
+))
+```
+
+```{r directional-stability-valence-plot, fig.width=9, fig.height=5}
+p_signed <- ggplot(df_asym, aes(x = condition, y = signed_z_diff, fill = condition)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.9) +
+  geom_jitter(width = 0.08, alpha = 0.35, size = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(values = condition_colors) +
+  labs(
+    title = "Signed valence-asymmetry direction by condition",
+    subtitle = "atanh(r_first_to_second) - atanh(r_second_to_first)",
+    x = "Condition",
+    y = expression(Delta * z)
+  ) +
+  theme(legend.position = "none")
+
+print(p_signed)
+ggsave(
+  file.path(GRAPHS_DIR, "valence_signed_asymmetry_direction.png"),
+  p_signed,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Permutation Test on `A_valence ~ condition`
+
+```{r permutation-valence}
+permutation_test_A(df_asym, "A_valence", R = 10000) %>%
+  knitr::kable(
+    digits = 4,
+    caption = "Permutation test on A_valence ~ condition (R = 10,000 story-label permutations)"
+  )
+```
+
+# Summary
+
+Primary cross-condition result: per-story $A_{\text{valence}} = |\operatorname{atanh}(r_{\text{first}\to\text{second},i}) - \operatorname{atanh}(r_{\text{second}\to\text{first},i})|$, tested with ANOVA + Kruskal and pairwise BH-adjusted Wilcoxon.
+
+Robustness layers added:
+
+- bootstrap 95% CIs on per-condition mean of $A_{\text{valence}}$
+- pairwise Cliff's $\delta$ effect sizes
+- planned single-df contrast HA vs (HH+AA)/2
+- 10k story-label permutation test on $A_{\text{valence}} \sim \text{condition}$

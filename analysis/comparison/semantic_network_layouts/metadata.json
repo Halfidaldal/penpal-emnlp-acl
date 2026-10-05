@@ -1,0 +1,25 @@
+{
+  "conditions": [
+    "human-ai",
+    "human-human",
+    "ai-ai"
+  ],
+  "method_requested": "pca",
+  "turn_layout_method": "PCA",
+  "turn_neighbors": 30,
+  "min_dist": 0.1,
+  "seed": 42,
+  "analysis_turn_min": 1,
+  "analysis_turn_max": 9,
+  "balance_stories": true,
+  "stories_per_condition": 36,
+  "balance_edges": true,
+  "edges_per_condition": 536,
+  "n_turn_nodes": 1848,
+  "n_turn_edges": 1608,
+  "mean_adjacent_distance_by_condition": {
+    "AI-AI": 0.299033,
+    "Human-AI": 0.310542,
+    "Human-Human": 0.285942
+  }
+}

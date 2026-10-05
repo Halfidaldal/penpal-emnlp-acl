@@ -1,0 +1,180 @@
+---
+title: "Transience uptake (2x2) and scorer-familiarity checks"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+source(here::here("analysis/comparison/_comparison_utils.R"))
+CONDITIONS <- ALL_CONDITIONS  # or PUBLISHED_CONDITIONS for the three-condition paper set
+```
+
+The 2x2 transience table (Table 3), the within-HA proportional novelty and
+uptake quoted in the text, and the AA model-family check on scorer
+familiarity, all computed from `novelty_scores.csv`.
+
+Quantities, per turn $T_t$ followed by the partner's turn $F_{t+1}$:
+
+- $S_{\text{base}}(T) = \bar{s}(T_t \mid \text{BOS})$, recovered as
+  `surprise_raw - surprise` (the contextual score minus novelty)
+- $\text{Novelty} = \bar{s}(T_t \mid C_t) - S_{\text{base}}(T)$, the `surprise` column
+- $S(F) = \bar{s}(F_{t+1} \mid C_t)$, the `transience_baseline` column
+- $\text{Transience} = \bar{s}(F_{t+1} \mid C_t, T_t) - S(F)$
+- proportional context gain $= -\text{Novelty} / S_{\text{base}}(T)$
+- uptake $= -\text{Transience} / S(F)$
+
+Every percentage is a story-clustered mean: the per-turn ratio is averaged
+within each story, then across stories.
+
+```{r load}
+df_raw <- load_novelty_data(CONDITIONS) %>%
+  filter(!conversation_id %in% EXCLUDED_CONVERSATIONS)
+
+# One row per turn, keeping which model wrote it where that is known.
+slot_rows <- function(df) {
+  bind_rows(lapply(c("author_1", "author_2"), function(slot) {
+    other <- if (slot == "author_1") "author_2" else "author_1"
+    # Cross-model stories: the model follows the starter role, since slots are
+    # counterbalanced. Same-model stories have a single model_id.
+    col_or_na <- function(name) if (name %in% names(df)) as.character(df[[name]]) else rep(NA_character_, nrow(df))
+    by_role <- if_else(col_or_na("starter_side") == slot, col_or_na("model_starter"), col_or_na("model_responder"))
+    model <- coalesce(by_role, col_or_na("model_id"))
+    tibble(
+      conversation_id = df$conversation_id,
+      condition = df$condition,
+      turn = df$turn,
+      speaker = df[[paste0(slot, "_type")]],
+      partner = df[[paste0(other, "_type")]],
+      model = model,
+      novelty = df[[paste0(slot, "_surprise")]],
+      contextual = df[[paste0(slot, "_surprise_raw")]],
+      transience = df[[paste0(slot, "_transience")]],
+      base_F = df[[paste0(slot, "_transience_baseline")]]
+    )
+  })) %>%
+    mutate(
+      base_T = contextual - novelty,
+      context_gain = -novelty / base_T,
+      uptake = -transience / base_F,
+      pairing = case_when(
+        condition == "ai-ai-cross" ~ "AI -> AI (cross-model)",
+        speaker == "human" & partner == "ai" ~ "Human -> AI",
+        speaker == "ai" & partner == "human" ~ "AI -> Human",
+        speaker == "human" & partner == "human" ~ "Human -> Human",
+        speaker == "ai" & partner == "ai" ~ "AI -> AI"
+      )
+    )
+}
+
+turns <- slot_rows(df_raw)
+
+story_mean <- function(df, ..., cols) {
+  df %>%
+    group_by(..., conversation_id) %>%
+    summarise(across(all_of(cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    group_by(...) %>%
+    summarise(n_stories = n(), across(all_of(cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+}
+```
+
+# Transience 2x2 (paper Table 3)
+
+Speaker type crossed with partner type, turns after the first ($t > 1$).
+Transience is measured on the partner's following turn, so who responds
+constrains the score; comparing within a row of the 2x2 holds the speaker
+fixed and varies the partner.
+
+```{r transience-2x2}
+pairing_order <- c("Human -> AI", "AI -> Human", "Human -> Human", "AI -> AI", "AI -> AI (cross-model)")
+
+t22 <- turns %>%
+  filter(turn > 1, !is.na(transience), !is.na(base_F)) %>%
+  story_mean(pairing, cols = c("base_F", "transience", "uptake")) %>%
+  mutate(pairing = factor(pairing, levels = pairing_order)) %>%
+  arrange(pairing)
+
+t22 %>%
+  mutate(uptake = 100 * uptake) %>%
+  knitr::kable(
+    digits = 2,
+    col.names = c("Pairing", "Stories", "Base S(F)", "Transience", "Uptake (%)"),
+    caption = "Transience 2x2: speaker -> partner, story-clustered means"
+  )
+
+up <- setNames(100 * t22$uptake, as.character(t22$pairing))
+```
+
+Derived in-text contrasts:
+
+- human turns, LLM partner vs human partner:
+  `r sprintf("%+.1f", up[["Human -> AI"]] - up[["Human -> Human"]])` percentage points of uptake
+- LLM turns, human partner vs LLM partner:
+  `r sprintf("%+.1f", up[["AI -> Human"]] - up[["AI -> AI"]])` percentage points of uptake
+- turns followed by a human writer:
+  `r sprintf("%.1f%%-%.1f%%", min(up[["AI -> Human"]], up[["Human -> Human"]]), max(up[["AI -> Human"]], up[["Human -> Human"]]))`;
+  turns followed by an LLM:
+  `r sprintf("%.1f%%-%.1f%%", min(up[["Human -> AI"]], up[["AI -> AI"]]), max(up[["Human -> AI"]], up[["AI -> AI"]]))`
+
+The AI -> AI uptake here is the story-clustered mean of per-turn ratios, like
+the other three cells. The paper's 38.4% equals the ratio of the two means
+beside it (`r sprintf("%.2f / %.2f = %.1f%%", -t22$transience[t22$pairing == "AI -> AI"], t22$base_F[t22$pairing == "AI -> AI"], -100 * t22$transience[t22$pairing == "AI -> AI"] / t22$base_F[t22$pairing == "AI -> AI"])`),
+so that one cell appears to have been computed differently.
+
+# Within Human-AI: how much of each turn the context explains
+
+```{r within-ha}
+turns %>%
+  filter(condition == "human-ai", turn > 1) %>%
+  story_mean(speaker, cols = c("novelty", "context_gain", "uptake")) %>%
+  mutate(across(c(context_gain, uptake), ~ 100 * .x)) %>%
+  knitr::kable(
+    digits = c(0, 0, 2, 1, 1),
+    col.names = c("Speaker", "Stories", "Novelty", "Context gain (%)", "Uptake (%)"),
+    caption = "HA: share of turn information explained by prior context, and uptake by the partner"
+  )
+```
+
+# Scorer familiarity: AA stratified by model family
+
+Does the scorer (`google/gemma-4-31B`) simply find LLM text easy to predict?
+If so, base surprisal would be low for every generator and the context gain
+would track base surprisal. Stratifying by generator separates the two. This
+check uses all turns, including the first, as in the paper.
+
+```{r family-check}
+family_rows <- turns %>%
+  filter(!is.na(novelty), !is.na(base_T)) %>%
+  mutate(group = case_when(
+    speaker == "human" ~ paste0("Human (", condition, ")"),
+    condition %in% c("ai-ai", "ai-ai-cross") ~ paste0(model, if_else(condition == "ai-ai-cross", " [cross]", "")),
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(group))
+
+family_rows %>%
+  story_mean(group, cols = c("base_T", "context_gain")) %>%
+  mutate(context_gain = 100 * context_gain) %>%
+  arrange(desc(base_T)) %>%
+  knitr::kable(
+    digits = 2,
+    col.names = c("Writer", "Stories", "Base surprisal (bits/token)", "Context gain (%)"),
+    caption = "Unconditional surprisal and proportional context gain by writer"
+  )
+```
+
+In the cross-model rows, a story counts once for each model that wrote in
+it, and the model is attributed per turn from `starter_side`, since the
+author columns are counterbalanced.
+
+# Not reproduced here
+
+The paper also reports a PERMANOVA on surface metrics (R^2 = 0.179), a
+length-controlled lexical-overlap test (0.052 vs 0.054, p = .53), a
+surface-novelty measure (rate of unused content words) and a shuffled-context
+control. Their exact specifications are not recoverable from the paper text,
+and the shuffled-context scores are not in the repository, so they are left
+out rather than approximated.

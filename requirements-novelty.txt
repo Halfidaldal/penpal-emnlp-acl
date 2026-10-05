@@ -1,0 +1,11 @@
+# scripts/05_compute_novelty.py (google/gemma-4-31B). Separate environment:
+# Gemma 4 needs transformers >= 5.5, which the embedding stack does not support.
+torch==2.9.0
+transformers>=5.5.0
+tokenizers>=0.22.1
+accelerate>=1.0.0
+protobuf>=5.29.0
+pandas==2.3.3
+numpy==2.3.4
+PyYAML==6.0.3
+tqdm==4.67.1

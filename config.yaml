@@ -1,0 +1,101 @@
+# Condition processed by the scripts; the EXPERIMENT environment variable overrides it.
+active_experiment: "human-ai"
+
+experiments:
+  human-ai:
+    raw_dir: "data/human-ai/raw"
+    interim_dir: "data/human-ai/interim"
+    processed_dir: "data/human-ai/processed"
+    raw_file: "finished_stories_raw.csv"
+    raw_columns: {author_1: "user", author_2: "ai"}
+    cleaning:
+      max_turns: 10
+      story_length: 9  # rows per story when a session holds several stories
+
+  human-human:
+    raw_dir: "data/human-human/raw"
+    interim_dir: "data/human-human/interim"
+    processed_dir: "data/human-human/processed"
+    raw_file: "finished_stories_raw.csv"
+    raw_columns: {author_1: "user", author_2: "user2"}
+    cleaning:
+      max_turns: 11
+
+  ai-ai:
+    raw_dir: "data/ai-ai/raw"
+    interim_dir: "data/ai-ai/interim"
+    processed_dir: "data/ai-ai/processed"
+    raw_file: "simulated_stories.csv"
+    raw_columns: {author_1: "agent_1", author_2: "agent_2"}
+    cleaning:
+      max_turns: 10
+    simulation:
+      n_stories_per_model: 20
+      n_turns_per_story: 10
+      temperature: 1.0
+      max_tokens: 40  # roughly the character limit imposed on human writers
+      models:
+        - id: "gpt-4.1-2025-04-14"
+          provider: "openai"
+          model_name: "gpt-4.1-2025-04-14"
+          env_key: "OPENAI_API_KEY"
+        - id: "claude-sonnet-4-5-20250929"
+          provider: "anthropic"
+          model_name: "claude-sonnet-4-5-20250929"
+          base_url: "https://api.anthropic.com/v1/"
+          env_key: "ANTHROPIC_API_KEY"
+        - id: "llama-70b"
+          provider: "huggingface"
+          model_name: "meta-llama/Llama-3.3-70B-Instruct"
+          base_url: "https://router.huggingface.co/v1"
+          env_key: "HF_API_KEY"
+        - id: "qwen-72b"
+          provider: "huggingface"
+          model_name: "qwen/qwen-2.5-72b-instruct"
+          base_url: "https://openrouter.ai/api/v1"
+          env_key: "OPENROUTER_API_KEY"
+
+  ai-ai-cross:
+    raw_dir: "data/ai-ai-cross/raw"
+    interim_dir: "data/ai-ai-cross/interim"
+    processed_dir: "data/ai-ai-cross/processed"
+    raw_file: "simulated_stories.csv"
+    raw_columns: {author_1: "agent_1", author_2: "agent_2"}
+    cleaning:
+      max_turns: 10
+
+shared:
+  random_seed: 42
+
+  # Deterministic text-quality QC (scripts/01_clean_dataset.py). A story is
+  # excluded when this many rows are flagged, or when its human opener is.
+  text_quality_qc:
+    story_exclusion_min_flagged_rows: 2
+    exclude_if_first_human_flagged: true
+    min_substantive_chars: 3
+    min_alpha_ratio: 0.45
+    max_symbol_ratio: 0.35
+    max_keyboard_pattern_ratio: 0.12
+    min_word_vowel_ratio: 0.35
+    long_token_chars: 24
+    min_word_count_for_vowel_check: 3
+
+  embeddings:
+    model_name: "Kingsoft-LLM/QZhou-Embedding"
+    batch_size: 1
+
+  sentiment:
+    model_name: "paraphrase-multilingual-mpnet-base-v2"
+    concept_vector_path: "src/nes/data/Sentiment.csv"
+    batch_size: 64
+
+  novelty:
+    model_name: "google/gemma-4-31B"
+
+  exploration:
+    max_lag: 10
+
+  surface_metrics:
+    spacy_model: "en_core_web_md"
+    batch_size: 10
+    n_process: 5

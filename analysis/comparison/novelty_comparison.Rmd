@@ -1,0 +1,715 @@
+---
+title: "Novelty, Transience and Resonance Across Conditions"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+
+source(here::here("analysis/comparison/_comparison_utils.R"))
+CONDITIONS <- ALL_CONDITIONS  # or PUBLISHED_CONDITIONS for the three-condition paper set
+
+GRAPHS_DIR <- file.path(PROJECT_ROOT, "analysis", "figures")
+dir.create(GRAPHS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+pacman::p_load(lme4, lmerTest, emmeans)
+
+theme_set(theme_comparison())
+```
+
+# Overview
+
+This notebook compares three information-theoretic metrics across conditions:
+
+- **Novelty / surprise**: how unexpected a contribution is given prior context
+- **Transience**: how quickly its influence fades
+- **Resonance**: novelty minus transience
+
+The analysis uses complete exchanges in `analysis_turn` 2 to 9, with `author_1` / `author_2` as slot 1 / slot 2. Role labels (Human / AI in Human-AI, starter side elsewhere) are used only in within-condition descriptive views.
+
+**Primary cross-condition object.** Following the paper's narrative-influence model, the main inferential result is the **within-condition novelty-to-resonance slope interaction** between the two slots, fit as $\text{resonance} \sim \text{surprise} \times \text{slot} + (1 \mid \text{conversation\_id})$ per condition. The cross-condition asymmetry magnitude is
+$$A_{\text{influence}}(\text{condition}) \;=\; \bigl|\, \beta_{\text{surprise},\,\text{slot}=1} - \beta_{\text{surprise},\,\text{slot}=2} \,\bigr|,$$
+extracted via `emtrends`. Per-story OLS slope differences provide a label-invariant robustness layer. The signed Human/AI decomposition is in [analysis/human-ai/novelty.Rmd](../human-ai/novelty.Rmd).
+
+**Metric-asymmetry companion.** Because a story can also be asymmetric in the level of each information-theoretic metric, this notebook additionally computes
+$$A_m(i) \;=\; \bigl|\, \overline{m}_{\text{slot}=1,\,i} - \overline{m}_{\text{slot}=2,\,i} \,\bigr|$$
+for novelty/surprise, transience, and resonance. Each story therefore contributes one unsigned slot-gap magnitude per metric.
+
+# Load Data
+
+```{r load-data}
+df_raw <- load_novelty_data(CONDITIONS) %>%
+  filter_complete_exchange_window() %>%
+  filter(turn_index > 1) %>%
+  filter(!conversation_id %in% EXCLUDED_CONVERSATIONS)
+
+df_raw %>%
+  group_by(condition) %>%
+  summarise(
+    n_stories = n_distinct(conversation_id),
+    n_turns = n(),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Loaded novelty data by condition")
+```
+
+# Preprocessing
+
+```{r preprocess}
+df_slots <- bind_rows(
+  df_raw %>%
+    transmute(
+      condition,
+      conversation_id,
+      turn_index,
+      slot = "author_1",
+      role_label = case_when(
+        condition == "human-ai" ~ str_to_title(author_1_type),
+        starter_side == "author_1" ~ "Starter-side",
+        TRUE ~ "Non-starter-side"
+      ),
+      surprise = author_1_surprise,
+      transience = author_1_transience,
+      resonance = author_1_surprise - author_1_transience
+    ),
+  df_raw %>%
+    transmute(
+      condition,
+      conversation_id,
+      turn_index,
+      slot = "author_2",
+      role_label = case_when(
+        condition == "human-ai" ~ str_to_title(author_2_type),
+        starter_side == "author_2" ~ "Starter-side",
+        TRUE ~ "Non-starter-side"
+      ),
+      surprise = author_2_surprise,
+      transience = author_2_transience,
+      resonance = author_2_surprise - author_2_transience
+    )
+) %>%
+  drop_na(surprise, transience, resonance) %>%
+  mutate(
+    condition = factor(
+      condition,
+      levels = intersect(ALL_CONDITIONS, unique(condition)),
+      labels = CONDITION_LABELS[intersect(ALL_CONDITIONS, unique(condition))]
+    ),
+    slot = factor(slot, levels = c("author_1", "author_2"), labels = c("Slot 1", "Slot 2"))
+  )
+
+df_long <- df_slots %>%
+  pivot_longer(
+    cols = c(surprise, transience, resonance),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric, levels = c("surprise", "transience", "resonance"))
+  )
+
+cat("Slot-level rows:", nrow(df_slots), "\n")
+cat("Metric rows:", nrow(df_long), "\n")
+```
+
+# Primary: Within-Condition Slot Slope-Interaction Asymmetry
+
+```{r primary-slope-interaction}
+# Fit resonance ~ surprise * slot + (1|story) within each condition.
+# The magnitude of the slope difference between slots is A_influence(condition).
+slope_results <- purrr::map_dfr(levels(df_slots$condition), function(cond) {
+  df_cond <- df_slots %>% filter(condition == cond)
+  if (nrow(df_cond) < 50 || n_distinct(df_cond$conversation_id) < 5) {
+    return(tibble())
+  }
+
+  df_cond$slot <- factor(df_cond$slot, levels = c("Slot 1", "Slot 2"))
+  contrasts(df_cond$slot) <- contr.sum(2)
+
+  model <- tryCatch(
+    lmer(
+      resonance ~ surprise * slot + (1 | conversation_id),
+      data = df_cond,
+      control = lmerControl(optimizer = "bobyqa")
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(model)) return(tibble())
+
+  slopes <- as.data.frame(emtrends(model, specs = "slot", var = "surprise"))
+  contrast_df <- as.data.frame(
+    contrast(emtrends(model, specs = "slot", var = "surprise"),
+             method = "revpairwise")
+  )
+
+  tibble(
+    condition = cond,
+    slope_slot1 = slopes$surprise.trend[slopes$slot == "Slot 1"],
+    slope_slot2 = slopes$surprise.trend[slopes$slot == "Slot 2"],
+    signed_diff = contrast_df$estimate[1],
+    se = contrast_df$SE[1],
+    t = contrast_df$t.ratio[1],
+    p = contrast_df$p.value[1],
+    A_influence = abs(contrast_df$estimate[1])
+  )
+})
+
+slope_results %>%
+  mutate(
+    sig = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01 ~ "**",
+      p < 0.05 ~ "*",
+      p < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Primary: |slope_1 - slope_2| from resonance ~ surprise * slot per condition"
+  )
+
+stopifnot(all(slope_results$A_influence >= 0))
+```
+
+
+```{r primary-per-story-robustness}
+# Per-story OLS slope difference; >= 4 points per slot.
+per_story_slope_diff <- df_slots %>%
+  group_by(condition, conversation_id, slot) %>%
+  summarise(
+    n_points = sum(!is.na(surprise) & !is.na(resonance)),
+    slope = if (n_points >= 4) {
+      coef(lm(resonance ~ surprise))[2]
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  select(condition, conversation_id, slot, slope) %>%
+  pivot_wider(names_from = slot, values_from = slope, names_prefix = "slope_") %>%
+  drop_na(`slope_Slot 1`, `slope_Slot 2`) %>%
+  mutate(
+    signed_diff = `slope_Slot 1` - `slope_Slot 2`,
+    A_influence_story = abs(signed_diff)
+  )
+
+per_story_slope_diff %>%
+  group_by(condition) %>%
+  summarise(
+    n_stories = n(),
+    median_A = median(A_influence_story),
+    mean_A = mean(A_influence_story),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Robustness: per-story |slope_1 - slope_2| (OLS per story, \u2265 4 points per slot)"
+  )
+
+if (n_distinct(per_story_slope_diff$condition) >= 2 && nrow(per_story_slope_diff) >= 10) {
+  cat("\nKruskal-Wallis on per-story A_influence:\n")
+  print(kruskal.test(A_influence_story ~ condition, data = per_story_slope_diff))
+
+  cat("\nPairwise Wilcoxon on per-story A_influence (BH-adjusted):\n")
+  print(pairwise.wilcox.test(
+    per_story_slope_diff$A_influence_story,
+    per_story_slope_diff$condition,
+    p.adjust.method = "BH"
+  ))
+}
+```
+
+# Metric-Level Slot Asymmetry
+
+Each story contributes one unsigned slot-gap magnitude per metric:
+$A_m(i) = |\overline{m}_{\text{slot 1},i} - \overline{m}_{\text{slot 2},i}|$.
+This compares asymmetry in the levels of novelty/surprise, transience, and
+resonance across conditions, separately from the novelty-to-resonance slope
+asymmetry above.
+
+```{r metric-level-asymmetry}
+per_story_metric_asym <- df_long %>%
+  group_by(condition, conversation_id, metric, slot) %>%
+  summarise(
+    side_mean = mean(value, na.rm = TRUE),
+    n_points = sum(!is.na(value)),
+    .groups = "drop"
+  ) %>%
+  filter(n_points > 0) %>%
+  select(condition, conversation_id, metric, slot, side_mean) %>%
+  pivot_wider(names_from = slot, values_from = side_mean) %>%
+  drop_na(`Slot 1`, `Slot 2`) %>%
+  mutate(
+    signed_diff = `Slot 1` - `Slot 2`,
+    A_metric = abs(signed_diff)
+  )
+
+stopifnot(all(per_story_metric_asym$A_metric >= 0))
+
+per_story_metric_asym %>%
+  group_by(metric, condition) %>%
+  summarise(
+    n_stories = n(),
+    mean_A = mean(A_metric),
+    median_A = median(A_metric),
+    sd_A = sd(A_metric),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Per-story |Slot 1 mean - Slot 2 mean| by condition and novelty metric"
+  )
+```
+
+```{r metric-level-asymmetry-tests}
+metric_asym_tests <- per_story_metric_asym %>%
+  group_by(metric) %>%
+  group_modify(~ {
+    anova_p <- tryCatch(
+      summary(aov(A_metric ~ condition, data = .x))[[1]][["Pr(>F)"]][1],
+      error = function(e) NA_real_
+    )
+    kw_p <- tryCatch(
+      kruskal.test(A_metric ~ condition, data = .x)$p.value,
+      error = function(e) NA_real_
+    )
+    tibble(anova_p = anova_p, kw_p = kw_p)
+  }) %>%
+  ungroup() %>%
+  mutate(
+    anova_p_BH = p.adjust(anova_p, method = "BH"),
+    kw_p_BH = p.adjust(kw_p, method = "BH")
+  )
+
+metric_asym_tests %>%
+  knitr::kable(
+    digits = 4,
+    caption = "Cross-condition tests for metric-level A_m ~ condition, BH-adjusted across metrics"
+  )
+
+metric_asym_pairwise <- per_story_metric_asym %>%
+  group_by(metric) %>%
+  group_modify(~ {
+    pw <- tryCatch(
+      pairwise.wilcox.test(.x$A_metric, .x$condition, p.adjust.method = "BH")$p.value,
+      error = function(e) NULL
+    )
+    if (is.null(pw)) {
+      return(tibble(contrast = character(), p_BH = numeric()))
+    }
+    as_tibble(as.data.frame(as.table(pw))) %>%
+      drop_na(Freq) %>%
+      transmute(
+        contrast = paste(Var1, "vs", Var2),
+        p_BH = Freq
+      )
+  }) %>%
+  ungroup()
+
+metric_asym_pairwise %>%
+  knitr::kable(
+    digits = 4,
+    caption = "Pairwise Wilcoxon tests for metric-level A_m by condition, BH-adjusted within metric"
+  )
+```
+
+```{r metric-level-asymmetry-plot, fig.width=12, fig.height=8}
+p_metric_asym <- ggplot(per_story_metric_asym, aes(x = condition, y = A_metric, fill = condition)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.9) +
+  geom_jitter(width = 0.08, alpha = 0.35, size = 0.9) +
+  scale_fill_manual(values = condition_colors) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    title = "Per-story metric-level slot asymmetry by condition",
+    subtitle = "A_m(i) = |mean_metric_slot1 - mean_metric_slot2|",
+    x = "Condition",
+    y = expression("|" * Delta * bar(m) * "|")
+  ) +
+  theme(legend.position = "none")
+
+print(p_metric_asym)
+ggsave(
+  file.path(GRAPHS_DIR, "novelty_metric_level_asymmetry.png"),
+  p_metric_asym,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+```
+
+# Bootstrap CIs and Effect Sizes on Metric-Level `A_m`
+
+```{r boot-effects-metric-asymmetry}
+metric_asym_boot <- per_story_metric_asym %>%
+  group_by(metric) %>%
+  group_modify(~ bootstrap_condition_means(.x, "A_metric", R = 10000)) %>%
+  ungroup()
+
+metric_asym_boot %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Bootstrap 95% CI on per-condition mean of metric-level A_m (R = 10,000)"
+  )
+
+metric_asym_effects <- per_story_metric_asym %>%
+  group_by(metric) %>%
+  group_modify(~ effect_sizes_pairwise(.x, "A_metric")) %>%
+  ungroup()
+
+metric_asym_effects %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Pairwise Cliff's delta on metric-level A_m"
+  )
+```
+
+# Planned Contrast: Metric-Level HA vs (HH + AA)/2
+
+```{r planned-contrast-metric-asymmetry}
+metric_asym_planned <- per_story_metric_asym %>%
+  group_by(metric) %>%
+  group_modify(~ planned_contrast_HA_vs_same(.x, "A_metric")) %>%
+  ungroup() %>%
+  mutate(p_BH = p.adjust(p, method = "BH"))
+
+metric_asym_planned %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Planned contrast: metric-level A_m in HA vs the average of HH and AA, BH-adjusted across metrics"
+  )
+```
+
+# Bootstrap CIs and Effect Sizes on `A_influence_story`
+
+```{r boot-effects-novelty}
+bootstrap_condition_means(per_story_slope_diff, "A_influence_story", R = 10000) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Bootstrap 95% CI on per-condition mean of per-story A_influence (R = 10,000)"
+  )
+
+effect_sizes_pairwise(per_story_slope_diff, "A_influence_story") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Pairwise Cliff's delta on per-story A_influence"
+  )
+```
+
+# Planned Contrast: HA vs (HH + AA)/2
+
+```{r planned-contrast-novelty}
+planned_contrast_HA_vs_same(per_story_slope_diff, "A_influence_story") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Planned contrast: per-story A_influence in HA vs the average of HH and AA"
+  )
+```
+
+# Directional Stability of Signed Novelty-Resonance Slope Asymmetry
+
+Tests whether the *direction* of the slot-1 vs slot-2 novelty-to-resonance
+slope difference is consistent across stories within each condition. The
+signed quantity is $\text{signed}_i = \beta^{\text{slot1}}_i - \beta^{\text{slot2}}_i$.
+HA-specific identity-tied directionality predicts high stability in HA and
+low stability in HH/AA, even when unsigned `A_influence` is similar.
+
+```{r directional-stability-novelty}
+ds_nov <- directional_stability(per_story_slope_diff, "signed_diff")
+ds_nov$by_condition %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Per-condition directional stability of signed novelty-resonance asymmetry"
+  )
+
+cat(sprintf(
+  "Brown-Forsythe variance-equality p = %.4f\n", ds_nov$variance_equality_p
+))
+```
+
+```{r directional-stability-novelty-plot, fig.width=9, fig.height=5}
+p_signed_nov <- ggplot(per_story_slope_diff, aes(x = condition, y = signed_diff, fill = condition)) +
+  geom_violin(alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.9) +
+  geom_jitter(width = 0.08, alpha = 0.35, size = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(values = condition_colors) +
+  labs(
+    title = "Signed novelty-resonance slope asymmetry by condition",
+    subtitle = "slope_slot1 - slope_slot2 per story",
+    x = "Condition",
+    y = expression(Delta * beta)
+  ) +
+  theme(legend.position = "none")
+
+print(p_signed_nov)
+ggsave(
+  file.path(GRAPHS_DIR, "novelty_signed_asymmetry_direction.png"),
+  p_signed_nov,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Length-Controlled Variant of `A_influence`
+
+Re-fit the within-condition LMM with turn length as an additive covariate
+and recompute the unsigned slope-slot magnitude. Tests whether condition-level
+slot-asymmetry differences survive turn-length adjustment.
+
+```{r length-controlled-novelty}
+pick_word_count_col <- function(prefix, df) {
+  candidates <- c(
+    paste0(prefix, "_word_count"),
+    paste0(prefix, "_n_words"),
+    paste0(prefix, "_nwords"),
+    paste0(prefix, "_text_qc_word_count")
+  )
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) NA_character_ else hit[[1]]
+}
+
+a1_wc <- pick_word_count_col("author_1", df_raw)
+a2_wc <- pick_word_count_col("author_2", df_raw)
+
+if (!is.na(a1_wc) && !is.na(a2_wc)) {
+  df_slots_nwords <- bind_rows(
+    df_raw %>%
+      transmute(
+        condition, conversation_id, turn_index,
+        slot = "author_1",
+        surprise = author_1_surprise,
+        transience = author_1_transience,
+        resonance = author_1_surprise - author_1_transience,
+        nwords = .data[[a1_wc]]
+      ),
+    df_raw %>%
+      transmute(
+        condition, conversation_id, turn_index,
+        slot = "author_2",
+        surprise = author_2_surprise,
+        transience = author_2_transience,
+        resonance = author_2_surprise - author_2_transience,
+        nwords = .data[[a2_wc]]
+      )
+  ) %>%
+    drop_na(surprise, resonance, nwords) %>%
+    mutate(
+      condition = factor(condition,
+        levels = intersect(ALL_CONDITIONS, unique(condition)),
+        labels = CONDITION_LABELS[intersect(ALL_CONDITIONS, unique(condition))]
+      ),
+      slot = factor(slot, levels = c("author_1", "author_2"), labels = c("Slot 1", "Slot 2"))
+    )
+
+  length_controlled <- purrr::map_dfr(levels(df_slots_nwords$condition), function(cond) {
+    df_cond <- df_slots_nwords %>% filter(condition == cond)
+    if (nrow(df_cond) < 50) return(tibble())
+    contrasts(df_cond$slot) <- contr.sum(2)
+    model <- tryCatch(
+      lmer(resonance ~ surprise * slot + nwords + (1 | conversation_id), data = df_cond,
+           control = lmerControl(optimizer = "bobyqa")),
+      error = function(e) NULL
+    )
+    if (is.null(model)) return(tibble())
+    contrast_df <- as.data.frame(
+      contrast(emtrends(model, specs = "slot", var = "surprise"), method = "revpairwise")
+    )
+    tibble(
+      condition = cond,
+      A_influence_lc = abs(contrast_df$estimate[1]),
+      se = contrast_df$SE[1],
+      p = contrast_df$p.value[1]
+    )
+  })
+
+  length_controlled %>%
+    knitr::kable(
+      digits = 3,
+      caption = "Length-controlled |slope_slot1 - slope_slot2| (resonance ~ surprise * slot + nwords)"
+    )
+} else {
+  cat("No author_1/author_2 word-count columns found in df_raw; length-controlled variant skipped.\n")
+}
+```
+
+# Supplemental: General Condition-Level Comparison
+
+```{r descriptives}
+df_long %>%
+  group_by(condition, metric) %>%
+  summarise(
+    n_stories = n_distinct(conversation_id),
+    n_obs = n(),
+    mean_value = mean(value, na.rm = TRUE),
+    sd_value = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Overall novelty metrics by condition"
+  )
+```
+
+```{r condition-distributions, fig.width=12, fig.height=8}
+p_condition_dens <- df_long %>%
+  ggplot(aes(x = value, fill = condition)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = condition_colors) +
+  facet_wrap(~metric, scales = "free", ncol = 1) +
+  labs(
+    title = "Novelty Metric Distributions by Condition",
+    x = "Metric Value",
+    y = "Density"
+  ) +
+  theme(legend.position = "bottom")
+
+print(p_condition_dens)
+ggsave(
+  file.path(GRAPHS_DIR, "novelty_condition_distributions.png"),
+  p_condition_dens,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r condition-models}
+for (metric_name in levels(df_long$metric)) {
+  cat("\n===", metric_name, "===\n")
+  model <- lmer(value ~ condition + (1 | conversation_id), data = filter(df_long, metric == metric_name))
+  print(summary(model))
+  print(pairs(emmeans(model, specs = "condition"), adjust = "bonferroni"))
+}
+```
+
+# Supplemental: Pooled Novelty-to-Resonance Relationship
+
+```{r novelty-resonance}
+innovation_model <- lmer(
+  resonance ~ surprise * condition + (1 | conversation_id),
+  data = df_slots
+)
+
+cat("Novelty-to-resonance model:\n")
+print(summary(innovation_model))
+
+cat("\nCondition-specific novelty-to-resonance slopes:\n")
+print(emtrends(innovation_model, specs = "condition", var = "surprise"))
+```
+
+```{r novelty-resonance-plot, fig.width=8, fig.height=5}
+novelty_resonance_slopes <- confint(
+  emtrends(innovation_model, specs = "condition", var = "surprise")
+) %>%
+  as.data.frame() %>%
+  mutate(condition = factor(condition, levels = levels(df_slots$condition)))
+
+lower_ci_col <- names(novelty_resonance_slopes)[str_detect(names(novelty_resonance_slopes), "lower|LCL")][1]
+upper_ci_col <- names(novelty_resonance_slopes)[str_detect(names(novelty_resonance_slopes), "upper|UCL")][1]
+
+novelty_resonance_slopes <- novelty_resonance_slopes %>%
+  mutate(
+    lower_ci = .data[[lower_ci_col]],
+    upper_ci = .data[[upper_ci_col]]
+  )
+
+p_novelty_resonance <- novelty_resonance_slopes %>%
+  ggplot(aes(x = condition, y = surprise.trend, color = condition)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.5) +
+  geom_pointrange(
+    aes(ymin = lower_ci, ymax = upper_ci),
+    linewidth = 1.6,
+    fatten = 3.8
+  ) +
+  geom_text(
+    aes(label = sprintf("%.2f", surprise.trend)),
+    nudge_x = 0.18,
+    fontface = "bold",
+    size = 4.2,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = condition_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0.12, 0.12))) +
+  labs(
+    title = "Novelty-to-Resonance Slopes by Condition",
+    subtitle = "Points show mixed-model slope estimates; intervals show 95% CIs",
+    x = NULL,
+    y = "Novelty-to-resonance slope"
+  ) +
+  theme(legend.position = "none")
+
+print(p_novelty_resonance)
+ggsave(
+  file.path(GRAPHS_DIR, "novelty_influence_per_condition.png"),
+  p_novelty_resonance,
+  width = 12,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Supplemental: Role-Level View
+
+```{r role-view, fig.width=12, fig.height=7}
+p_role_view <- df_slots %>%
+  pivot_longer(
+    cols = c(surprise, transience, resonance),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = role_label, y = value, fill = role_label)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.1) +
+  facet_grid(metric ~ condition, scales = "free_y") +
+  labs(
+    title = "Role-Conditioned Novelty Metrics",
+    subtitle = "Within-condition role view only: Human / AI in Human-AI; Starter-side / Non-starter-side in same-type conditions",
+    x = NULL,
+    y = "Metric Value"
+  ) +
+  theme(legend.position = "none")
+
+print(p_role_view)
+ggsave(
+  file.path(GRAPHS_DIR, "novelty_role_view.png"),
+  p_role_view,
+  width = 12,
+  height = 7,
+  dpi = 300
+)
+```
+
+# Summary
+
+Primary cross-condition result: within each condition, $A_{\text{influence}} = |\,\beta_{\text{surprise},\,\text{slot}=1} - \beta_{\text{surprise},\,\text{slot}=2}\,|$ from `resonance ~ surprise * slot + (1|conversation_id)`. The pooled LMM contributes only the unsigned magnitude column. Per-story OLS slope differences provide the label-invariant robustness test.
+
+Metric-level companion result: each story also contributes $A_m(i) = |\overline{m}_{\text{slot 1},i} - \overline{m}_{\text{slot 2},i}|$ for surprise, transience, and resonance. These tests compare side-level asymmetry in the metrics themselves across conditions, rather than asymmetry in the novelty-to-resonance slope.
+
+Robustness layers added:
+
+- bootstrap 95% CIs on per-condition mean of per-story `A_influence`
+- per-metric tests, bootstrap CIs, Cliff's $\delta$, and HA vs (HH+AA)/2 contrasts for metric-level `A_m`
+- pairwise Cliff's $\delta$ effect sizes
+- planned single-df contrast HA vs (HH+AA)/2
+- length-controlled re-fit (`+ nwords`) of the unsigned magnitude
+
+Supplemental views retained:
+
+- condition-level marginal distributions and pooled `condition` LMMs
+- pooled novelty-to-resonance model with `surprise * condition` interaction
+- within-condition role box-plots (descriptive only; HA Human/AI inferential view lives in [analysis/human-ai/novelty.Rmd](../human-ai/novelty.Rmd))

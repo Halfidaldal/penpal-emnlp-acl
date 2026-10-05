@@ -1,0 +1,718 @@
+---
+title: "Semantic Distance Across Conditions"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+
+source(here::here("analysis/comparison/_comparison_utils.R"))
+CONDITIONS <- ALL_CONDITIONS  # or PUBLISHED_CONDITIONS for the three-condition paper set
+
+pacman::p_load(lme4, lmerTest, patchwork, emmeans)
+GRAPHS_DIR <- file.path(PROJECT_ROOT, "analysis", "figures")
+
+theme_set(theme_comparison())
+```
+
+# Overview
+
+`semantic_exploration_binned.parquet` holds lag-based distances: `k` is the lag, `distance` the mean cosine distance at that lag, and `agent` is `"interleaved"` (full exchange sequence) or `author_1` / `author_2`.
+
+This notebook uses the turn embeddings to reconstruct the alternating sequence and analyse:
+
+1. **Adjacent turn-to-turn semantic distance** across conditions as the primary analysis
+2. **Story-level mean adjacent distance** as the supporting aggregate
+3. **Turn-level adjacent semantic-distance networks** as descriptive 2D maps
+4. **Lag-based trajectories** as supplemental descriptive context
+
+- The adjacent sequence includes both within-exchange steps (e.g., slot 1$_t$ to slot 2$_t$) and between-exchange steps (e.g., slot 2$_t$ to slot 1$_{t+1}$).
+- For Human-AI, the sequence is kept in the standard human-to-AI row order. For same-type dyads, `starter_side` determines which slot speaks first within each exchange.
+- **Human / AI** in Human-AI and **Starter-side / Non-starter-side** in same-type conditions are only used as descriptive views.
+
+**Primary cross-condition object.** Each adjacent pair in the reconstructed alternating sequence contributes one semantic distance. The main model compares these adjacent distances by condition while nesting observations within story:
+$$d_{ij} = \beta_0 + \beta_1 \mathrm{condition}_{ij} + u_{\mathrm{story}(j)} + \epsilon_{ij}.$$
+
+The 2D network layouts are precomputed by `scripts/07_compute_semantic_network_layouts.py`, which samples the same number of stories and edges per condition.
+
+# Load Data
+
+```{r load-data}
+excluded_conversations <- c(
+  "conv_ed575a06c11d42358e3eeb7826d2f959",
+  "conv_a63a08273d0a4704a7638e4cd6850225"
+)
+
+df_combined <- load_exploration_data(CONDITIONS) %>%
+  filter(k > 1) %>%
+  prepare_condition_factor(reference = "human-ai") %>%
+  filter(!conversation_id %in% excluded_conversations)
+
+df_embeddings <- load_conditions(
+  CONDITIONS,
+  "story_embeddings_interaction_level.parquet",
+  prepare = function(df) df %>% filter_complete_exchange_window() %>% drop_provider_error_stories()
+) %>%
+  filter(!conversation_id %in% excluded_conversations) %>%
+  prepare_condition_factor(reference = "human-ai")
+
+df_combined %>%
+  group_by(condition, agent) %>%
+  summarise(
+    n_stories = n_distinct(conversation_id),
+    n_rows = n(),
+    min_k = min(k, na.rm = TRUE),
+    max_k = max(k, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Loaded semantic exploration rows by condition and agent view")
+```
+
+# Preprocessing
+
+```{r preprocess}
+df_interleaved <- df_combined %>%
+  filter(agent == "interleaved") %>%
+  drop_na(distance, k)
+
+df_speaker <- df_combined %>%
+  filter(agent != "interleaved") %>%
+  filter(speaker_slot %in% c("author_1", "author_2")) %>%
+  mutate(
+    slot = factor(speaker_slot, levels = c("author_1", "author_2"), labels = c("Slot 1", "Slot 2"))
+  ) %>%
+  drop_na(distance, k)
+
+cat("Interleaved rows:", nrow(df_interleaved), "\n")
+cat("Speaker rows:", nrow(df_speaker), "\n")
+cat("Embedding rows:", nrow(df_embeddings), "\n")
+```
+
+# Primary: Adjacent Turn-to-Turn Semantic Distance
+
+```{r adjacent-distance-functions}
+parse_embedding_r <- function(x) {
+  if (is.null(x) || length(x) == 0) return(NULL)
+  if (is.character(x)) {
+    x <- gsub("^\\[|\\]$", "", x)
+    out <- suppressWarnings(as.numeric(strsplit(x, ",")[[1]]))
+  } else {
+    out <- suppressWarnings(as.numeric(unlist(x, use.names = FALSE)))
+  }
+  if (length(out) == 0 || any(!is.finite(out))) return(NULL)
+  out
+}
+
+cosine_distance <- function(a, b) {
+  if (is.null(a) || is.null(b) || length(a) != length(b)) return(NA_real_)
+  denom <- sqrt(sum(a * a)) * sqrt(sum(b * b))
+  if (!is.finite(denom) || denom == 0) return(NA_real_)
+  sim <- sum(a * b) / denom
+  1 - pmax(pmin(sim, 1), -1)
+}
+
+story_slot_order <- function(story_df) {
+  condition_value <- as.character(story_df$condition[1])
+  starter_values <- na.omit(as.character(story_df$starter_side))
+  starter_side <- if (length(starter_values) > 0) starter_values[1] else NA_character_
+
+  if (condition_value == "Human-AI") {
+    c("author_1", "author_2")
+  } else if (!is.na(starter_side) && starter_side == "author_2") {
+    c("author_2", "author_1")
+  } else {
+    c("author_1", "author_2")
+  }
+}
+
+build_story_sequence <- function(story_df) {
+  story_df <- story_df %>%
+    arrange(turn_index)
+
+  slot_order <- story_slot_order(story_df)
+
+  map_dfr(seq_len(nrow(story_df)), function(i) {
+    row_i <- story_df[i, ]
+    first_slot <- slot_order[1]
+    second_slot <- slot_order[2]
+
+    tibble(
+      sequence_index = c(2 * i - 1, 2 * i),
+      turn_index = c(row_i$turn_index, row_i$turn_index),
+      slot = c(first_slot, second_slot),
+      embedding = list(
+        parse_embedding_r(row_i[[paste0(first_slot, "_embedding")]][[1]]),
+        parse_embedding_r(row_i[[paste0(second_slot, "_embedding")]][[1]])
+      )
+    )
+  }) %>%
+    filter(map_lgl(embedding, ~ !is.null(.x)))
+}
+
+build_story_adjacent_distances <- function(story_df) {
+  sequence_df <- build_story_sequence(story_df)
+
+  if (nrow(sequence_df) < 2) {
+    return(tibble())
+  }
+
+  n_seq <- nrow(sequence_df)
+
+  tibble(
+    pair_index = seq_len(n_seq - 1),
+    from_turn = sequence_df$turn_index[-n_seq],
+    to_turn = sequence_df$turn_index[-1],
+    from_slot = sequence_df$slot[-n_seq],
+    to_slot = sequence_df$slot[-1],
+    pair_type = if_else(from_turn == to_turn, "within_exchange", "between_exchange"),
+    adjacent_distance = map2_dbl(
+      sequence_df$embedding[-n_seq],
+      sequence_df$embedding[-1],
+      cosine_distance
+    )
+  ) %>%
+    filter(is.finite(adjacent_distance))
+}
+
+df_adjacent <- df_embeddings %>%
+  group_by(condition, conversation_id) %>%
+  group_modify(~ build_story_adjacent_distances(.x), .keep = TRUE) %>%
+  ungroup() %>%
+  mutate(
+    pair_type = factor(pair_type, levels = c("within_exchange", "between_exchange"))
+  )
+
+df_adjacent %>%
+  group_by(condition) %>%
+  summarise(
+    n_adjacent_pairs = n(),
+    n_stories = n_distinct(conversation_id),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Adjacent semantic-distance observations by condition")
+
+df_adjacent %>%
+  group_by(condition) %>%
+  summarise(
+    n = n(),
+    n_stories = n_distinct(conversation_id),
+    mean_distance = mean(adjacent_distance),
+    sd_distance = sd(adjacent_distance),
+    median_distance = median(adjacent_distance),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Adjacent turn-to-turn semantic distance by condition"
+  )
+```
+
+```{r adjacent-distance-model}
+if (n_distinct(df_adjacent$condition) >= 2 && nrow(df_adjacent) >= 10) {
+  model_adjacent <- lmer(
+    adjacent_distance ~ condition + (1 | conversation_id),
+    data = df_adjacent
+  )
+
+  cat("Main mixed model: adjacent_distance ~ condition + (1 | conversation_id)\n")
+  print(summary(model_adjacent))
+
+  emm_adjacent <- emmeans(model_adjacent, specs = "condition")
+
+  cat("\nEstimated marginal means by condition:\n")
+  print(emm_adjacent)
+
+  cat("\nPairwise condition contrasts (BH-adjusted):\n")
+  print(pairs(emm_adjacent, adjust = "BH"))
+
+  cat("\nPlanned contrast: Human-AI vs same-type average:\n")
+  print(contrast(
+    emm_adjacent,
+    method = list("Human-AI - mean(Human-Human, AI-AI)" = condition_weights(emm_adjacent, HA_VS_SAME_TYPE))
+  ))
+}
+```
+
+```{r adjacent-distance-plot, fig.width=9, fig.height=4.5}
+semantic_density_boxplot <- function(df, value_col, title, subtitle, x_label) {
+  plot_data <- df %>%
+    select(condition, value = all_of(value_col)) %>%
+    drop_na(value)
+
+  density_panel <- ggplot(plot_data, aes(x = value, fill = condition, color = condition)) +
+    geom_density(alpha = 0.28, linewidth = 0.9, na.rm = TRUE) +
+    scale_fill_manual(values = condition_colors, name = NULL) +
+    scale_color_manual(values = condition_colors, name = NULL) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = NULL,
+      y = "Density"
+    ) +
+    theme(
+      legend.position = "top",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 10),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      plot.margin = margin(4, 8, 0, 8)
+    )
+
+  box_panel <- ggplot(plot_data, aes(x = value, y = condition, fill = condition)) +
+    geom_boxplot(width = 0.45, outlier.alpha = 0.2, alpha = 0.9, na.rm = TRUE) +
+    scale_fill_manual(values = condition_colors, name = NULL) +
+    labs(x = x_label, y = NULL) +
+    theme(
+      legend.position = "none",
+      axis.text.y = element_text(size = 10),
+      plot.margin = margin(0, 8, 4, 8)
+    )
+
+  density_panel / box_panel + plot_layout(heights = c(2.6, 1))
+}
+
+turn_level_semanticplots <- semantic_density_boxplot(
+  df_adjacent,
+  "adjacent_distance",
+  "Adjacent turn-to-turn semantic distance by condition",
+  "Each density overlays one condition; boxplots summarize the same values below",
+  "Adjacent semantic distance"
+)
+
+print(turn_level_semanticplots)
+
+ggsave(
+  file.path(GRAPHS_DIR, "semantic_distance_interactionlevel.png"),
+  turn_level_semanticplots,
+  width = 9,
+  height = 4.5,
+  dpi = 300
+)
+
+```
+
+# Supporting: Story-Level Mean Adjacent Distance
+
+```{r story-mean-adjacent}
+df_adjacent_story <- df_adjacent %>%
+  group_by(condition, conversation_id) %>%
+  summarise(
+    n_pairs = n(),
+    mean_adjacent_distance = mean(adjacent_distance, na.rm = TRUE),
+    median_adjacent_distance = median(adjacent_distance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_adjacent_story %>%
+  group_by(condition) %>%
+  summarise(
+    n = n(),
+    mean_story_distance = mean(mean_adjacent_distance),
+    sd_story_distance = sd(mean_adjacent_distance),
+    median_story_distance = median(mean_adjacent_distance),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Story-level mean adjacent semantic distance by condition"
+  )
+```
+
+```{r story-mean-adjacent-tests}
+if (n_distinct(df_adjacent_story$condition) >= 2 && nrow(df_adjacent_story) >= 10) {
+  cat("One-way ANOVA: mean_adjacent_distance ~ condition\n")
+  print(summary(aov(mean_adjacent_distance ~ condition, data = df_adjacent_story)))
+
+  cat("\nKruskal-Wallis (robust): mean_adjacent_distance ~ condition\n")
+  print(kruskal.test(mean_adjacent_distance ~ condition, data = df_adjacent_story))
+
+  cat("\nPairwise Wilcoxon (BH-adjusted):\n")
+  print(pairwise.wilcox.test(
+    df_adjacent_story$mean_adjacent_distance,
+    df_adjacent_story$condition,
+    p.adjust.method = "BH"
+  ))
+}
+```
+
+```{r story-mean-adjacent-plot, fig.width=9, fig.height=4.5}
+semantic_distance_storylevel <- semantic_density_boxplot(
+  df_adjacent_story,
+  "mean_adjacent_distance",
+  "Story-level mean adjacent semantic distance by condition",
+  "One mean adjacent distance per story",
+  "Mean adjacent semantic distance"
+)
+
+print(semantic_distance_storylevel)
+
+ggsave(
+  file.path(GRAPHS_DIR, "semantic_distance_storylevel.png"),
+  semantic_distance_storylevel,
+  width = 9,
+  height = 4.5,
+  dpi = 300
+)
+```
+
+# Bootstrap CIs and Effect Sizes on Story Means
+
+```{r boot-effects-adjacent-story}
+bootstrap_condition_means(df_adjacent_story, "mean_adjacent_distance", R = 10000) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Bootstrap 95% CI on per-condition mean of story-level adjacent distance (R = 10,000)"
+  )
+
+effect_sizes_pairwise(df_adjacent_story, "mean_adjacent_distance") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Pairwise Cliff's delta on story-level mean adjacent distance"
+  )
+```
+
+# Planned Contrast: HA vs (HH + AA)/2
+
+```{r planned-contrast-adjacent-story}
+planned_contrast_HA_vs_same(df_adjacent_story, "mean_adjacent_distance") %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Planned contrast: story-level mean adjacent distance in HA vs the average of HH and AA"
+  )
+```
+
+# Supplemental: Turn-Level Adjacent Semantic-Distance Network
+
+```{r turn-adjacent-network-data}
+network_dir <- here::here("analysis", "comparison", "semantic_network_layouts")
+network_paths <- list(
+  turn_nodes = file.path(network_dir, "turn_nodes.csv"),
+  turn_edges = file.path(network_dir, "turn_edges.csv"),
+  metadata = file.path(network_dir, "metadata.json")
+)
+
+network_available <- all(file.exists(unlist(network_paths)))
+
+if (network_available) {
+  df_turn_network <- read_csv(network_paths$turn_nodes, show_col_types = FALSE) %>%
+    mutate(condition = factor(condition, levels = names(condition_colors)))
+  turn_edges <- read_csv(network_paths$turn_edges, show_col_types = FALSE) %>%
+    mutate(
+      condition = factor(condition, levels = names(condition_colors)),
+      adjacent_distance = as.numeric(adjacent_distance),
+      closeness = 1 - scales::rescale(
+        adjacent_distance,
+        to = c(0, 1),
+        from = quantile(adjacent_distance, c(0.05, 0.95), na.rm = TRUE)
+      ),
+      closeness = pmax(pmin(closeness, 1), 0),
+      pair_type = factor(pair_type, levels = c("within_exchange", "between_exchange"))
+    )
+  network_metadata <- jsonlite::fromJSON(network_paths$metadata)
+  close_distance_threshold <- quantile(turn_edges$adjacent_distance, 0.40, na.rm = TRUE)
+  close_edges <- turn_edges %>%
+    filter(adjacent_distance <= close_distance_threshold)
+
+  turn_edge_labels <- turn_edges %>%
+    group_by(condition) %>%
+    summarise(
+      mean_distance = mean(adjacent_distance, na.rm = TRUE),
+      x = quantile(c(x, xend), 0.03, na.rm = TRUE),
+      y = quantile(c(y, yend), 0.97, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(
+      close_edges %>%
+        count(condition, name = "n_close"),
+      by = "condition"
+    ) %>%
+    mutate(
+      pct_close = 100 * n_close / as.numeric(table(turn_edges$condition)[as.character(condition)]),
+      label = sprintf("Mean d = %.3f\nClose edges: %.0f%%", mean_distance, pct_close)
+    )
+} else {
+  df_turn_network <- tibble()
+  turn_edges <- tibble()
+  close_edges <- tibble()
+  turn_edge_labels <- tibble()
+  close_distance_threshold <- NA_real_
+  network_metadata <- list(turn_layout_method = "not computed")
+  cat(
+    "Precomputed semantic network files not found. Run:\n",
+    "python scripts/07_compute_semantic_network_layouts.py\n"
+  )
+}
+```
+
+```{r turn-adjacent-network-plot, fig.width=13, fig.height=6}
+if (network_available) {
+  network_panel <- ggplot() +
+    geom_point(
+      data = df_turn_network,
+      aes(x = x, y = y),
+      color = "grey65",
+      alpha = 0.18,
+      size = 0.45
+    ) +
+    geom_segment(
+      data = close_edges,
+      aes(
+        x = x,
+        y = y,
+        xend = xend,
+        yend = yend,
+        linewidth = closeness,
+        group = conversation_id
+      ),
+      color = "grey10",
+      alpha = 0.58,
+      lineend = "round"
+    ) +
+    geom_label(
+      data = turn_edge_labels,
+      aes(x = x, y = y, label = label),
+      hjust = 0,
+      vjust = 1,
+      label.size = 0,
+      fill = "white",
+      alpha = 0.85,
+      size = 3.2
+    ) +
+    facet_wrap(~condition, nrow = 1) +
+    scale_linewidth_continuous(range = c(0.15, 1.55), guide = "none") +
+    labs(
+      title = "Adjacent semantic continuity networks",
+      subtitle = paste0(
+        "Only semantically close links (global closest 40%; d <= ",
+        sprintf("%.3f", close_distance_threshold),
+        "). Missing links indicate larger semantic jumps"
+      ),
+      x = NULL,
+      y = NULL
+    ) +
+    theme(
+      legend.position = "none",
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA)
+    )
+
+  distance_panel <- ggplot(turn_edges, aes(x = adjacent_distance, fill = condition)) +
+    geom_density(alpha = 0.75, color = NA, adjust = 1.1) +
+    geom_vline(
+      xintercept = close_distance_threshold,
+      linetype = "dashed",
+      color = "grey25",
+      linewidth = 0.35
+    ) +
+    facet_wrap(~condition, nrow = 1) +
+    scale_fill_manual(values = condition_colors) +
+    labs(
+      x = "Adjacent semantic distance",
+      y = "Density"
+    ) +
+    theme(
+      legend.position = "none",
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA),
+      strip.text = element_blank()
+    )
+
+  semantic_network <- network_panel / distance_panel +
+    plot_layout(heights = c(3.2, 1))
+} else {
+  semantic_network <- ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0,
+      label = "Run python scripts/07_compute_semantic_network_layouts.py to generate this plot."
+    ) +
+    theme_void()
+}
+
+ggsave(
+  file.path(GRAPHS_DIR, "semantic_network.png"),
+  semantic_network,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+
+```
+
+
+# Supplemental: General Condition-Level Comparison
+
+```{r interleaved-descriptives}
+df_interleaved %>%
+  group_by(condition, k) %>%
+  summarise(
+    mean_distance = mean(distance, na.rm = TRUE),
+    sd_distance = sd(distance, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Interleaved semantic distance by lag and condition"
+  )
+```
+
+```{r interleaved-plot, fig.width=12, fig.height=5}
+interleaved_summary <- df_interleaved %>%
+  group_by(condition, k) %>%
+  summarise(
+    mean_distance = mean(distance, na.rm = TRUE),
+    se_distance = sd(distance, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(interleaved_summary, aes(x = k, y = mean_distance, color = condition)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  geom_ribbon(
+    aes(ymin = mean_distance - 1.96 * se_distance,
+        ymax = mean_distance + 1.96 * se_distance,
+        fill = condition),
+    alpha = 0.18,
+    color = NA
+  ) +
+  scale_color_manual(values = condition_colors) +
+  scale_fill_manual(values = condition_colors) +
+  labs(
+    title = "Interleaved Semantic Exploration by Lag",
+    subtitle = "Mean distance with 95% confidence intervals",
+    x = "Lag Bin (k)",
+    y = "Semantic Distance"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+```{r interleaved-model}
+model_interleaved <- lmer(
+  distance ~ k * condition + (1 | conversation_id),
+  data = df_interleaved
+)
+
+cat("Interleaved model summary:\n")
+print(summary(model_interleaved))
+
+emm_interleaved <- emmeans(model_interleaved, specs = "condition")
+
+cat("\nCondition contrasts (interleaved view):\n")
+print(pairs(emm_interleaved, adjust = "bonferroni"))
+```
+
+# Supplemental: Role-Level View
+
+```{r speaker-descriptives}
+df_speaker %>%
+  group_by(condition, condition_role, k) %>%
+  summarise(
+    mean_distance = mean(distance, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Speaker-level semantic distance by condition, role, and lag"
+  )
+```
+
+```{r role-plot, fig.width=12, fig.height=6}
+role_summary <- df_speaker %>%
+  filter(!is.na(condition_role)) %>%
+  group_by(condition, condition_role, k) %>%
+  summarise(
+    mean_distance = mean(distance, na.rm = TRUE),
+    se_distance = sd(distance, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(role_summary, aes(x = k, y = mean_distance, color = condition_role)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  geom_ribbon(
+    aes(ymin = mean_distance - 1.96 * se_distance,
+        ymax = mean_distance + 1.96 * se_distance,
+        fill = condition_role),
+    alpha = 0.15,
+    color = NA
+  ) +
+  facet_wrap(~condition) +
+  labs(
+    title = "Speaker-Level Semantic Exploration by Role",
+    subtitle = "Within-condition role view only: Human / AI in Human-AI; Starter-side / Non-starter-side in same-type conditions",
+    x = "Lag Bin (k)",
+    y = "Semantic Distance",
+    color = "Role",
+    fill = "Role"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+# Supplemental: Interleaved vs Speaker View
+
+```{r view-comparison, fig.width=12, fig.height=5}
+view_summary <- bind_rows(
+  df_interleaved %>%
+    mutate(view = "Interleaved sequence") %>%
+    select(condition, conversation_id, k, distance, view),
+  df_speaker %>%
+    mutate(view = "Speaker-specific") %>%
+    select(condition, conversation_id, k, distance, view)
+) %>%
+  group_by(condition, view, k) %>%
+  summarise(
+    mean_distance = mean(distance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(view_summary, aes(x = k, y = mean_distance, color = condition)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  facet_wrap(~view) +
+  scale_color_manual(values = condition_colors) +
+  labs(
+    title = "Interleaved vs Speaker-Specific Semantic Distance",
+    x = "Lag Bin (k)",
+    y = "Mean Semantic Distance"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+# Summary
+
+Primary cross-condition result: adjacent turn-to-turn semantic distance from the reconstructed alternating dyadic sequence, tested with a mixed model that nests adjacent observations within story. This includes both within-exchange distances and the cross-exchange step from the second turn of one exchange to the first turn of the next exchange.
+
+Robustness layers added:
+
+- story-level mean adjacent distance as an aggregate supporting analysis
+- bootstrap 95% CIs on per-condition story means
+- pairwise Cliff's $\delta$ effect sizes on story means
+- planned single-df contrast HA vs (HH+AA)/2 on story means
+
+Supplemental views retained:
+
+- turn-level adjacent semantic-distance network, with edge color/width encoding original-space adjacent distance
+- lag-based speaker-level slot trajectories
+- lag-based interleaved sequence model and condition descriptives
+- within-condition role curves (descriptive only)
+- interleaved vs speaker-specific side-by-side view

@@ -1,0 +1,26 @@
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.RDataTmp*
+renv/library/
+renv/staging/
+renv/local/
+renv/sandbox/
+*_files/
+*_cache/
+
+# Python
+.venv/
+venv/
+.venv-novelty/
+__pycache__/
+*.pyc
+
+# Credentials
+.env
+.env.local
+
+# LaTeX / OS
+*.log
+.DS_Store
